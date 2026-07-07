@@ -203,6 +203,13 @@ impl NodeClient {
         proto::GetBlocksRequestMessage,
         proto::GetBlocksResponseMessage
     );
+    rpc_method!(
+        get_mempool_entries,
+        GetMempoolEntriesRequest,
+        GetMempoolEntriesResponse,
+        proto::GetMempoolEntriesRequestMessage,
+        proto::GetMempoolEntriesResponseMessage
+    );
 
     // --- subscriptions (indexer only) ---
     // The node replies with an id-matched `Notify*Response`; the actual events

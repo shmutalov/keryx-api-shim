@@ -270,7 +270,8 @@ async fn indexer_pipeline_end_to_end() {
 
     let url = format!("http://{node_addr}");
     let (node, notifs) = NodeClient::spawn_indexed(url.clone(), Duration::from_secs(5));
-    let indexer = crate::indexer::spawn(node.clone(), notifs, 7, temp_dir());
+    // mempool poll disabled (0) — the mock has no mempool to serve.
+    let indexer = crate::indexer::spawn(node.clone(), notifs, 7, temp_dir(), 0);
     let probe = indexer.clone();
 
     let cfg =

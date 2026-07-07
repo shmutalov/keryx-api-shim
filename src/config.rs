@@ -54,4 +54,9 @@ pub struct Config {
     /// Directory for the indexer's redb data file.
     #[arg(long, env = "KERYX_SHIM_INDEXER_DIR", default_value = "./indexer-data")]
     pub indexer_dir: std::path::PathBuf,
+
+    /// Mempool poll interval (ms) for the indexer's pending-tx overlay, which
+    /// surfaces an HTLC claim's preimage at relay time. 0 disables polling.
+    #[arg(long, env = "KERYX_SHIM_MEMPOOL_POLL_MS", default_value_t = 2000)]
+    pub mempool_poll_ms: u64,
 }

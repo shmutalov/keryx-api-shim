@@ -206,7 +206,7 @@ pub async fn address_history(
 ) -> Result<Json<dto::AddressHistoryResponse>, ApiError> {
     dto::validate_address(&address).map_err(ApiError::BadRequest)?;
 
-    let Some(store) = app.indexer.as_ref().and_then(|h| h.store()) else {
+    let Some(indexer) = app.indexer.as_ref().filter(|h| h.store().is_some()) else {
         return Ok(Json(dto::AddressHistoryResponse {
             address,
             total_received_sompi: 0,
@@ -215,23 +215,39 @@ pub async fn address_history(
             history_since_daa: None,
         }));
     };
+    let store = indexer.store().unwrap();
 
     let limit = query.limit.unwrap_or(10).clamp(1, HISTORY_MAX_LIMIT);
     let offset = query.offset.unwrap_or(0);
     let rows = store.address_history(&address, limit, offset)?;
     let (total_received_sompi, total_tx_count) = store.address_totals(&address)?;
     let history_since_daa = store.window_low_daa()?;
-    let transactions = rows
-        .into_iter()
-        .map(|r| dto::HistoryTx {
-            tx_id: r.tx_id,
-            amount_sompi: r.amount_sompi,
-            is_spend: r.is_spend,
-            daa_score: r.daa_score,
-            block_hash: r.block_hash,
-            address: address.clone(),
-        })
-        .collect();
+
+    // Prepend unconfirmed (mempool) rows on the first page only, tagged
+    // pending with daa_score 0, so the wallet shows relayed txs immediately.
+    let mut transactions: Vec<dto::HistoryTx> = Vec::new();
+    if offset == 0 {
+        for p in indexer.mempool().history(&address) {
+            transactions.push(dto::HistoryTx {
+                tx_id: p.tx_id,
+                amount_sompi: p.amount_sompi,
+                is_spend: p.is_spend,
+                daa_score: 0,
+                block_hash: String::new(),
+                address: address.clone(),
+                pending: true,
+            });
+        }
+    }
+    transactions.extend(rows.into_iter().map(|r| dto::HistoryTx {
+        tx_id: r.tx_id,
+        amount_sompi: r.amount_sompi,
+        is_spend: r.is_spend,
+        daa_score: r.daa_score,
+        block_hash: r.block_hash,
+        address: address.clone(),
+        pending: false,
+    }));
     Ok(Json(dto::AddressHistoryResponse {
         address,
         total_received_sompi,
@@ -333,8 +349,20 @@ pub async fn outpoint_spend(
             "transaction id must be 64 hex chars".into(),
         ));
     }
-    let store = require_index(&app)?;
-    match store.spend_of(&tx_id, index)? {
+    let indexer = app
+        .indexer
+        .as_ref()
+        .filter(|h| h.store().is_some())
+        .ok_or_else(|| {
+            ApiError::NotFound("transaction index is not enabled on this shim".into())
+        })?;
+
+    // Mempool first: an HTLC claim's preimage is visible at relay time, before
+    // it is mined.
+    if let Some(pending) = indexer.mempool().spend_of(&tx_id, index) {
+        return Ok(Json(json!({ "status": "mempool", "transaction": pending })));
+    }
+    match indexer.store().unwrap().spend_of(&tx_id, index)? {
         Some(itx) => Ok(Json(json!({
             "status": "accepted",
             "transaction": tx_to_json(&itx),

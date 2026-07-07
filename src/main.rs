@@ -38,6 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             notifs,
             cfg.indexer_window_days,
             cfg.indexer_dir.clone(),
+            cfg.mempool_poll_ms,
         );
         tracing::info!(
             "indexer enabled (window {} days); node must run --retention-period-days >= {}",

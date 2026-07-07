@@ -209,8 +209,14 @@ node's retention is unknown/short.
    `GET /outpoints/{txid}/{index}/spend` (HTLC preimage path), `/info.total_txs`
    from the indexer counter. Verified live on simnet against real coinbase
    data (address attribution, coinbase detection, payload passthrough, 404s).
-4. **M4 — mempool overlay:** pending history entries + relay-time spend/preimage
-   visibility.
+4. **M4 — mempool overlay ✅ (2026-07-08):** in-RAM overlay
+   (`src/indexer/mempool.rs`) refreshed by a poller (`--mempool-poll-ms`),
+   indexing the mempool as outpoint→pending-tx (relay-time preimage) and
+   address→pending-rows. `/outpoints/.../spend` returns `status: "mempool"`
+   before mining; history prepends pending rows (`daa_score: 0`, `pending:
+   true`) on the first page. Verified live: poller runs clean against the
+   node; overlay logic covered by a unit test (spend indexing + preimage +
+   debit attribution via the store).
 5. **M5 — hardening & release:** perf replay, crash tests, README/API docs,
    `v0.2.0`.
 

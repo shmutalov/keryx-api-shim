@@ -82,6 +82,9 @@ pub struct HistoryTx {
     pub daa_score: u64,
     pub block_hash: String,
     pub address: String,
+    /// True for unconfirmed (mempool) rows, which are prepended to the first
+    /// page with `daa_score: 0`. Additive — the current wallet ignores it.
+    pub pending: bool,
 }
 
 #[derive(Debug, Serialize)]

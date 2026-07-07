@@ -16,6 +16,7 @@
 //! checkpoint (idempotent by chain-block hash).
 
 pub mod address;
+pub mod mempool;
 pub mod store;
 
 use std::collections::{HashMap, VecDeque};
@@ -26,6 +27,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::node::{proto, NodeClient, NodeError, Notification};
+use mempool::Mempool;
 use store::{AcceptedGroup, RawIn, RawOut, RawTx, Store};
 
 const STAGE_BLOCK_CAP: usize = 20_000;
@@ -67,17 +69,23 @@ struct IndexerStatus {
 }
 
 /// Cheap-to-clone handle: read-only status for `/health` plus access to the
-/// store for the indexed read endpoints (M3).
+/// store and mempool overlay for the indexed read endpoints (M3/M4).
 #[derive(Clone)]
 pub struct IndexerHandle {
     status: Arc<RwLock<IndexerStatus>>,
     store: Arc<OnceLock<Store>>,
+    mempool: Arc<Mempool>,
 }
 
 impl IndexerHandle {
     /// The store, once the indexer has learned the network and opened it.
     pub fn store(&self) -> Option<&Store> {
         self.store.get()
+    }
+
+    /// The mempool overlay (empty until the poller runs, or if disabled).
+    pub fn mempool(&self) -> &Mempool {
+        &self.mempool
     }
 
     pub fn json(&self) -> Value {
@@ -91,6 +99,7 @@ impl IndexerHandle {
             "chain_blocks": s.chain_blocks,
             "resolve_misses": s.resolve_misses,
             "staged_blocks": s.staged_blocks,
+            "mempool_pending": self.mempool.pending_count(),
             "generation": s.generation,
         })
     }
@@ -101,6 +110,7 @@ pub fn spawn(
     notifs: mpsc::Receiver<Notification>,
     window_days: u64,
     data_dir: PathBuf,
+    mempool_poll_ms: u64,
 ) -> IndexerHandle {
     let status = Arc::new(RwLock::new(IndexerStatus {
         state: IndexerState::Connecting,
@@ -114,11 +124,22 @@ pub fn spawn(
         generation: 0,
     }));
     let store = Arc::new(OnceLock::new());
+    let mempool = Arc::new(Mempool::default());
     let handle = IndexerHandle {
         status: status.clone(),
         store: store.clone(),
+        mempool: mempool.clone(),
     };
-    tokio::spawn(run(node, notifs, status, store, data_dir, window_days));
+    tokio::spawn(run(
+        node,
+        notifs,
+        status,
+        store,
+        mempool,
+        data_dir,
+        window_days,
+        mempool_poll_ms,
+    ));
     handle
 }
 
@@ -133,13 +154,16 @@ struct Ctx {
     total_misses: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     node: NodeClient,
     mut notifs: mpsc::Receiver<Notification>,
     status: Arc<RwLock<IndexerStatus>>,
     store_cell: Arc<OnceLock<Store>>,
+    mempool: Arc<Mempool>,
     data_dir: PathBuf,
     window_days: u64,
+    mempool_poll_ms: u64,
 ) {
     let mut staging = Staging::new();
     let mut ctx = Ctx {
@@ -157,8 +181,17 @@ async fn run(
                 });
                 if store_cell.get().is_none() {
                     match open_store(&node, &data_dir).await {
-                        Ok(store) => {
+                        Ok((store, prefix)) => {
                             let _ = store_cell.set(store);
+                            // Start the mempool poller once, now that the store
+                            // (needed for debit attribution) and prefix are known.
+                            mempool::spawn_poller(
+                                node.clone(),
+                                store_cell.clone(),
+                                mempool.clone(),
+                                prefix,
+                                mempool_poll_ms,
+                            );
                         }
                         Err(e) => {
                             tracing::error!(
@@ -212,7 +245,10 @@ async fn run(
     tracing::info!("indexer: node notification stream closed; stopping");
 }
 
-async fn open_store(node: &NodeClient, data_dir: &std::path::Path) -> Result<Store, String> {
+async fn open_store(
+    node: &NodeClient,
+    data_dir: &std::path::Path,
+) -> Result<(Store, String), String> {
     let network = node
         .get_block_dag_info(proto::GetBlockDagInfoRequestMessage {})
         .await
@@ -223,7 +259,8 @@ async fn open_store(node: &NodeClient, data_dir: &std::path::Path) -> Result<Sto
         "indexer: opening store at {} (prefix {prefix})",
         data_dir.display()
     );
-    Store::open(data_dir, prefix).map_err(|e| e.to_string())
+    let store = Store::open(data_dir, prefix).map_err(|e| e.to_string())?;
+    Ok((store, prefix.to_string()))
 }
 
 async fn subscribe(node: &NodeClient) -> Result<(), NodeError> {
