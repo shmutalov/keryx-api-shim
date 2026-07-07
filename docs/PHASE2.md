@@ -217,8 +217,20 @@ node's retention is unknown/short.
    true`) on the first page. Verified live: poller runs clean against the
    node; overlay logic covered by a unit test (spend indexing + preimage +
    debit attribution via the store).
-5. **M5 — hardening & release:** perf replay, crash tests, README/API docs,
-   `v0.2.0`.
+5. **M5 — hardening & release ✅ (2026-07-08):** store ingest benched at
+   ~48k blocks/s (478× the 100/s gate; the node RPC, not the store, is the
+   bound); crash-recovery verified live (kill -9 resume). README documents the
+   indexer, endpoints, retention, and the node `--retention-period-days`
+   requirement. Released as `v0.2.0`.
+
+   **Design note — forward-fill:** a fresh index starts at the current tip and
+   fills forward; it does not deep-replay history from before it first ran
+   (mapping tip−window to a start hash needs a block at a target DAA, which the
+   RPC doesn't expose; the pruning point is the only natural deep-start and can
+   be very large). After a restart it gap-backfills from its committed
+   checkpoint. Since the window is the swap app's recovery buffer, the shim is
+   meant to run continuously. Deep historical backfill from the pruning point
+   is a future enhancement.
 
 Each milestone lands green on the existing CI (fmt, clippy `-D warnings`,
 tests) and keeps `--indexer` off-by-default until M5.

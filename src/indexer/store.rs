@@ -781,6 +781,42 @@ mod tests {
         crate::indexer::address::script_to_address(&format!("20{pk}ac"), "keryxsim").unwrap()
     }
 
+    // Ingest throughput sanity check (run with: cargo test --release perf_ -- --ignored --nocapture).
+    // The plan's gate is >= 100 blocks/s; one coinbase per block, batched per
+    // apply as the live pipeline does.
+    #[test]
+    #[ignore]
+    fn perf_ingest_throughput() {
+        let s = temp_store();
+        let blocks = 20_000u64;
+        let batch = 500u64;
+        let start = std::time::Instant::now();
+        let mut daa = 0u64;
+        let mut n = 0u64;
+        while n < blocks {
+            let groups: Vec<AcceptedGroup> = (0..batch)
+                .map(|_| {
+                    daa += 1;
+                    group(
+                        &format!("blk{daa}"),
+                        daa,
+                        vec![coinbase(&format!("cb{daa}"), PK1, 5_000)],
+                    )
+                })
+                .collect();
+            s.apply(&groups).unwrap();
+            n += batch;
+        }
+        let secs = start.elapsed().as_secs_f64();
+        let rate = blocks as f64 / secs;
+        println!("ingested {blocks} blocks in {secs:.2}s = {rate:.0} blocks/s");
+        assert_eq!(s.total_txs().unwrap(), blocks);
+        assert!(
+            rate >= 100.0,
+            "ingest {rate:.0} blocks/s below the 100 gate"
+        );
+    }
+
     #[test]
     fn apply_records_history_totals_and_checkpoint() {
         let s = temp_store();
