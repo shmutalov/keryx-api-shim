@@ -9,8 +9,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: arduino/setup-protoc@v3
+      - uses: actions/checkout@v7
+      - uses: rustfs/setup-protoc@v3.0.1
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
