@@ -1,0 +1,29 @@
+[package]
+name = "keryx-api-shim"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, small REST shim between the Keryx Wallet Extension and keryxd (gRPC). Not an indexer."
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.12", features = ["gzip"] }
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+thiserror = "2"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
