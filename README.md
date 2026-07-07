@@ -98,6 +98,9 @@ chain info, health. The wallet's hard-required paths (`balance`, `utxos`, `broad
 are fully live; polling-driven UI (5–15 s intervals, no websockets) is absorbed by
 small TTL caches, no database anywhere.
 
+The full phase-2 design — a rolling-window indexer sized for the HTLC
+atomic-swap app — is specified in [docs/PHASE2.md](docs/PHASE2.md).
+
 Deferred to the indexer phase (stubs today, seams ready):
 
 - per-address transaction history (`GET /api/v1/addresses/{addr}`) with `total_tx_count`
