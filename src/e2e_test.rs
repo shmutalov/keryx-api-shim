@@ -198,6 +198,7 @@ async fn spawn_stack() -> (String, Arc<Mutex<Option<proto::RpcTransaction>>>) {
         node,
         caches: crate::cache::Caches::default(),
         http: reqwest::Client::new(),
+        indexer: None,
         cfg,
     });
     let app = crate::api::router(state);

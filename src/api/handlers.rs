@@ -331,6 +331,10 @@ pub async fn health(State(app): State<AppState>) -> Result<Json<Value>, ApiError
         .node
         .get_server_info(proto::GetServerInfoRequestMessage {})
         .await?;
+    let indexer = match &app.indexer {
+        Some(handle) => handle.json(),
+        None => json!("disabled"),
+    };
     Ok(Json(json!({
         "status": "ok",
         "node": {
@@ -339,7 +343,8 @@ pub async fn health(State(app): State<AppState>) -> Result<Json<Value>, ApiError
             "is_synced": si.is_synced,
             "has_utxo_index": si.has_utxo_index,
             "virtual_daa_score": si.virtual_daa_score,
-        }
+        },
+        "indexer": indexer,
     })))
 }
 

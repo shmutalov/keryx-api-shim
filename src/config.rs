@@ -39,4 +39,15 @@ pub struct Config {
     /// Hard cap for the `limit` query parameter on the UTXO endpoint.
     #[arg(long, env = "KERYX_SHIM_MAX_UTXO_LIMIT", default_value_t = 10_000)]
     pub max_utxo_limit: usize,
+
+    /// Enable the windowed indexer (phase 2). Off by default; requires keryxd
+    /// with `--retention-period-days` >= the indexer window for gapless
+    /// backfill. See docs/PHASE2.md.
+    #[arg(long, env = "KERYX_SHIM_INDEXER", default_value_t = false)]
+    pub indexer: bool,
+
+    /// Rolling retention window for indexed history, in days. Sized for the
+    /// swap app's recovery buffer, not just lock time.
+    #[arg(long, env = "KERYX_SHIM_INDEXER_WINDOW_DAYS", default_value_t = 7)]
+    pub indexer_window_days: u64,
 }

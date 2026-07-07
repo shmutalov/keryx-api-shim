@@ -188,9 +188,13 @@ node's retention is unknown/short.
 
 ## 9. Milestones
 
-1. **M1 — pipeline skeleton:** NodeClient notifications + subscriptions,
-   staging/acceptance flow, checkpointing, counters; linear chain only;
-   behind `--indexer`.
+1. **M1 — pipeline skeleton ✅ (2026-07-08):** NodeClient notifications +
+   subscriptions, staging/acceptance flow, checkpointing, counters; linear
+   chain only; behind `--indexer`. In-memory store (`MemStore`) behind the
+   `IndexStore` trait; `/health` exposes indexer state. Verified live on the
+   simnet stack: went live in ~6 s and tracked the tip with checkpoint,
+   `total_txs`, and `applied_blocks` advancing in lockstep. Durable store and
+   reorg unwind are M2.
 2. **M2 — window & reorgs:** DAA segments, expiry, `accepted_by` unwind,
    crash-safe idempotent apply.
 3. **M3 — endpoints:** real history (+`history_since_daa`), `/transactions/{id}`,

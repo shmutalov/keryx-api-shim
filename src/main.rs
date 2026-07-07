@@ -4,6 +4,9 @@ mod config;
 #[cfg(test)]
 mod e2e_test;
 mod error;
+mod indexer;
+#[cfg(test)]
+mod indexer_e2e_test;
 mod node;
 
 use std::sync::Arc;
@@ -25,10 +28,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic::transport::Endpoint::from_shared(cfg.node_grpc.clone())
         .map_err(|e| format!("invalid --node-grpc url {:?}: {e}", cfg.node_grpc))?;
 
-    let node = node::NodeClient::spawn(
-        cfg.node_grpc.clone(),
-        Duration::from_secs(cfg.node_timeout_secs),
-    );
+    let node_timeout = Duration::from_secs(cfg.node_timeout_secs);
+    // When the indexer is on, take the client's notification stream and hand it
+    // to the indexer task; otherwise use the plain (notification-less) client.
+    let (node, indexer) = if cfg.indexer {
+        let (node, notifs) = node::NodeClient::spawn_indexed(cfg.node_grpc.clone(), node_timeout);
+        let handle = indexer::spawn(node.clone(), notifs, cfg.indexer_window_days);
+        tracing::info!(
+            "indexer enabled (window {} days); node must run --retention-period-days >= {}",
+            cfg.indexer_window_days,
+            cfg.indexer_window_days
+        );
+        (node, Some(handle))
+    } else {
+        (
+            node::NodeClient::spawn(cfg.node_grpc.clone(), node_timeout),
+            None,
+        )
+    };
     let listen = cfg.listen;
     let state: api::AppState = Arc::new(api::AppInner {
         node,
@@ -36,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?,
+        indexer,
         cfg,
     });
 

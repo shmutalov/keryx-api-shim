@@ -17,6 +17,9 @@ pub struct AppInner {
     pub node: NodeClient,
     pub caches: Caches,
     pub http: reqwest::Client,
+    /// Present only when the indexer is enabled (`--indexer`). Surfaced via
+    /// `/health`; from M3 it also backs the indexed read endpoints.
+    pub indexer: Option<crate::indexer::IndexerHandle>,
 }
 
 pub type AppState = Arc<AppInner>;
