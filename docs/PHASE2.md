@@ -4,6 +4,16 @@ Implementation plan, agreed 2026-07-08. Phase 1 (v0.1.0) serves everything a bar
 `--utxoindex` keryxd can answer; phase 2 adds the pieces that need indexing —
 sized for the real product, not for an explorer.
 
+## 0. Source code locations (local dev machine)
+
+| repo | path | notes |
+|---|---|---|
+| Keryx Node (`keryxd`) | `D:\Projects\other\keryx-node` | rusty-kaspa fork; protos vendored from `rpc/grpc/core/proto` |
+| Keryx Wallet Extension | `D:\Projects\mine\keryx-wallet-extension` | wire contract: `src/lib/api.js`, `docs/PROTOCOL.md` |
+| Keryx Swap | `D:\Projects\mine\keryx-swap` | the HTLC atomic-swap app this phase is sized for |
+| Keryx Miner (upstream, CUDA) | `D:\Projects\other\keryx-miner` | |
+| Keryx Miner RDNA3 (Vulkan) | `D:\Projects\other\keryx-miner-rdna3` | |
+
 ## 1. Context and driving constraints
 
 - The shim fronts the **Keryx Wallet Extension** for an **atomic-swap
