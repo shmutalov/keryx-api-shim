@@ -16,14 +16,20 @@ const IPFS_MAX_BYTES: usize = 1024 * 1024;
 
 pub async fn info(State(app): State<AppState>) -> Result<Json<dto::InfoResponse>, ApiError> {
     let app2 = app.clone();
-    let info = app.caches.info.get_or_try_init(move || build_info(app2)).await?;
+    let info = app
+        .caches
+        .info
+        .get_or_try_init(move || build_info(app2))
+        .await?;
     Ok(Json(info))
 }
 
 async fn build_info(app: AppState) -> Result<dto::InfoResponse, ApiError> {
     let (dag, supply) = tokio::try_join!(
-        app.node.get_block_dag_info(proto::GetBlockDagInfoRequestMessage {}),
-        app.node.get_coin_supply(proto::GetCoinSupplyRequestMessage {}),
+        app.node
+            .get_block_dag_info(proto::GetBlockDagInfoRequestMessage {}),
+        app.node
+            .get_coin_supply(proto::GetCoinSupplyRequestMessage {}),
     )?;
 
     // Best-effort extras on their own longer TTLs: /info must not fail (the
@@ -52,7 +58,10 @@ async fn build_info(app: AppState) -> Result<dto::InfoResponse, ApiError> {
         .block_reward
         .get_or_init(move || async move {
             match node
-                .get_block(proto::GetBlockRequestMessage { hash: sink, include_transactions: true })
+                .get_block(proto::GetBlockRequestMessage {
+                    hash: sink,
+                    include_transactions: true,
+                })
                 .await
             {
                 Ok(resp) => coinbase_reward_krx(&resp).unwrap_or(0.0),
@@ -76,7 +85,11 @@ async fn build_info(app: AppState) -> Result<dto::InfoResponse, ApiError> {
         burned_krx: 0.0,
         total_escrow_krx: 0.0,
         total_real_inferences: 0,
-        mined_pct: if max_supply > 0.0 { circulating / max_supply * 100.0 } else { 0.0 },
+        mined_pct: if max_supply > 0.0 {
+            circulating / max_supply * 100.0
+        } else {
+            0.0
+        },
     })
 }
 
@@ -85,8 +98,12 @@ async fn build_info(app: AppState) -> Result<dto::InfoResponse, ApiError> {
 /// single-block reward figure available without an indexer.
 fn coinbase_reward_krx(resp: &proto::GetBlockResponseMessage) -> Option<f64> {
     let coinbase = resp.block.as_ref()?.transactions.first()?;
-    let mut amounts: Vec<u64> =
-        coinbase.outputs.iter().map(|o| o.amount).filter(|&a| a > 0).collect();
+    let mut amounts: Vec<u64> = coinbase
+        .outputs
+        .iter()
+        .map(|o| o.amount)
+        .filter(|&a| a > 0)
+        .collect();
     if amounts.is_empty() {
         return None;
     }
@@ -107,7 +124,10 @@ pub async fn balance(
             address: address.clone(),
         })
         .await?;
-    Ok(Json(dto::BalanceResponse { address, balance_sompi: resp.balance }))
+    Ok(Json(dto::BalanceResponse {
+        address,
+        balance_sompi: resp.balance,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -121,7 +141,10 @@ pub async fn utxos(
     Query(query): Query<UtxoQuery>,
 ) -> Result<Json<Vec<dto::UtxoDto>>, ApiError> {
     dto::validate_address(&address).map_err(ApiError::BadRequest)?;
-    let limit = query.limit.unwrap_or(400).clamp(1, app.cfg.max_utxo_limit.max(1));
+    let limit = query
+        .limit
+        .unwrap_or(400)
+        .clamp(1, app.cfg.max_utxo_limit.max(1));
     let mut utxos = fetch_utxos(&app, address).await?;
     // Largest-first, so a truncated page is still the most useful set for the
     // wallet's greedy coin selection.
@@ -185,8 +208,9 @@ pub async fn broadcast(
     State(app): State<AppState>,
     payload: Result<Json<dto::TxJson>, JsonRejection>,
 ) -> Result<Json<dto::BroadcastResponse>, ApiError> {
-    let Json(tx) = payload
-        .map_err(|e| ApiError::BadRequest(format!("invalid transaction JSON: {}", e.body_text())))?;
+    let Json(tx) = payload.map_err(|e| {
+        ApiError::BadRequest(format!("invalid transaction JSON: {}", e.body_text()))
+    })?;
     tx.validate().map_err(ApiError::BadRequest)?;
     let resp = app
         .node
@@ -195,7 +219,9 @@ pub async fn broadcast(
             allow_orphan: false,
         })
         .await?;
-    Ok(Json(dto::BroadcastResponse { transaction_id: resp.transaction_id }))
+    Ok(Json(dto::BroadcastResponse {
+        transaction_id: resp.transaction_id,
+    }))
 }
 
 // --- /api/v1/market -------------------------------------------------------------------
@@ -203,7 +229,9 @@ pub async fn broadcast(
 pub async fn market(State(app): State<AppState>) -> Result<Json<Value>, ApiError> {
     let Some(url) = app.cfg.market_upstream.clone() else {
         // The wallet catch-guards this call and simply hides USD values.
-        return Err(ApiError::NotFound("market data is not configured on this shim".into()));
+        return Err(ApiError::NotFound(
+            "market data is not configured on this shim".into(),
+        ));
     };
     let http = app.http.clone();
     let value = app
@@ -258,7 +286,9 @@ pub async fn ipfs(
         return Err(ApiError::BadRequest("invalid IPFS CID".into()));
     }
     let Some(gateway) = &app.cfg.ipfs_gateway else {
-        return Err(ApiError::NotFound("no IPFS gateway is configured on this shim".into()));
+        return Err(ApiError::NotFound(
+            "no IPFS gateway is configured on this shim".into(),
+        ));
     };
     let url = format!("{}/ipfs/{cid}", gateway.trim_end_matches('/'));
     let mut resp = app
@@ -268,14 +298,21 @@ pub async fn ipfs(
         .await
         .map_err(|e| ApiError::Upstream(format!("ipfs gateway: {e}")))?;
     if !resp.status().is_success() {
-        return Err(ApiError::Upstream(format!("ipfs gateway returned {}", resp.status())));
+        return Err(ApiError::Upstream(format!(
+            "ipfs gateway returned {}",
+            resp.status()
+        )));
     }
     let mut body: Vec<u8> = Vec::new();
-    while let Some(chunk) =
-        resp.chunk().await.map_err(|e| ApiError::Upstream(format!("ipfs gateway: {e}")))?
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| ApiError::Upstream(format!("ipfs gateway: {e}")))?
     {
         if body.len() + chunk.len() > IPFS_MAX_BYTES {
-            return Err(ApiError::Upstream("ipfs object exceeds the 1 MiB proxy limit".into()));
+            return Err(ApiError::Upstream(
+                "ipfs object exceeds the 1 MiB proxy limit".into(),
+            ));
         }
         body.extend_from_slice(&chunk);
     }
@@ -290,7 +327,10 @@ pub async fn ipfs(
 // --- /health --------------------------------------------------------------------------
 
 pub async fn health(State(app): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let si = app.node.get_server_info(proto::GetServerInfoRequestMessage {}).await?;
+    let si = app
+        .node
+        .get_server_info(proto::GetServerInfoRequestMessage {})
+        .await?;
     Ok(Json(json!({
         "status": "ok",
         "node": {
@@ -311,7 +351,9 @@ mod tests {
     fn cid_v0_validation() {
         assert!(is_cid_v0("QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"));
         assert!(!is_cid_v0("QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbd")); // 45 chars
-        assert!(!is_cid_v0("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")); // CIDv1
+        assert!(!is_cid_v0(
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+        )); // CIDv1
         assert!(!is_cid_v0("QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdO")); // 'O' not base58
         assert!(!is_cid_v0("../../../etc/passwd")); // traversal attempt
     }

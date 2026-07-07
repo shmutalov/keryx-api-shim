@@ -1,9 +1,9 @@
 mod api;
 mod cache;
 mod config;
-mod error;
 #[cfg(test)]
 mod e2e_test;
+mod error;
 mod node;
 
 use std::sync::Arc;
@@ -33,7 +33,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state: api::AppState = Arc::new(api::AppInner {
         node,
         caches: cache::Caches::default(),
-        http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?,
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?,
         cfg,
     });
 

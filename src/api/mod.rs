@@ -24,10 +24,19 @@ pub type AppState = Arc<AppInner>;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/info", get(handlers::info))
-        .route("/api/v1/addresses/{address}", get(handlers::address_history))
-        .route("/api/v1/addresses/{address}/balance", get(handlers::balance))
+        .route(
+            "/api/v1/addresses/{address}",
+            get(handlers::address_history),
+        )
+        .route(
+            "/api/v1/addresses/{address}/balance",
+            get(handlers::balance),
+        )
         .route("/api/v1/addresses/{address}/utxos", get(handlers::utxos))
-        .route("/api/v1/addresses/{address}/utxos/count", get(handlers::utxo_count))
+        .route(
+            "/api/v1/addresses/{address}/utxos/count",
+            get(handlers::utxo_count),
+        )
         .route("/api/v1/broadcast", post(handlers::broadcast))
         .route("/api/v1/market", get(handlers::market))
         // AI-inference oracle endpoints — indexer phase; see handlers::empty_list.
@@ -47,7 +56,11 @@ pub fn router(state: AppState) -> Router {
 /// instead of surfacing only as failing wallet requests.
 pub async fn startup_probe(app: AppState) {
     for _ in 0..12 {
-        match app.node.get_server_info(proto::GetServerInfoRequestMessage {}).await {
+        match app
+            .node
+            .get_server_info(proto::GetServerInfoRequestMessage {})
+            .await
+        {
             Ok(si) => {
                 if !si.has_utxo_index {
                     tracing::warn!(

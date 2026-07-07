@@ -16,7 +16,9 @@ Keryx Wallet Extension ── HTTPS/REST ──> keryx-api-shim ── gRPC (pro
 
 ## Running
 
-Requirements: Rust toolchain + `protoc` (protobuf compiler) on PATH.
+Prebuilt binaries for Linux and Windows are attached to
+[GitHub Releases](../../releases); alternatively build from source
+(Rust toolchain + `protoc` on PATH) or use Docker (below).
 
 ```sh
 # 1. Node — must expose gRPC (on by default, loopback :22110) and run the UTXO index:
@@ -25,6 +27,23 @@ keryxd --utxoindex
 # 2. Shim:
 cargo run --release
 # → listening on http://127.0.0.1:8787
+```
+
+### Docker
+
+The image binds `0.0.0.0:8787` inside the container (override with
+`KERYX_SHIM_LISTEN`); only `protoc`-less Docker is needed on the host.
+
+```sh
+docker build -t keryx-api-shim .
+
+# node on the host:
+docker run --rm -p 8787:8787 \
+  -e KERYX_SHIM_NODE_GRPC=http://host.docker.internal:22110 keryx-api-shim
+
+# node in a compose stack: attach to its network and use the service name
+docker run --rm -p 8787:8787 --network <stack-network> \
+  -e KERYX_SHIM_NODE_GRPC=http://keryxd:22110 keryx-api-shim
 ```
 
 ### Configuration (flags or env vars)
@@ -91,7 +110,13 @@ Deferred to the indexer phase (stubs today, seams ready):
 
 ```sh
 cargo test        # unit tests + an in-process e2e: real router → real gRPC client → mock protowire node
+cargo fmt
+cargo clippy --all-targets -- -D warnings
 ```
+
+CI (fmt, clippy, tests) runs on every push/PR; pushing a `v*` tag builds
+Linux + Windows binaries and publishes a GitHub release
+(`.github/workflows/`).
 
 Protos under `proto/` are vendored verbatim from `keryx-node/rpc/grpc/core/proto` so the
 shim builds standalone. The node client (`src/node.rs`) multiplexes every RPC over

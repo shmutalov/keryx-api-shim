@@ -13,7 +13,10 @@ pub struct TtlCell<T> {
 
 impl<T: Clone> TtlCell<T> {
     pub fn new(ttl: Duration) -> Self {
-        Self { ttl, slot: RwLock::new(None) }
+        Self {
+            ttl,
+            slot: RwLock::new(None),
+        }
     }
 
     async fn fresh(&self) -> Option<T> {

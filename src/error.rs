@@ -30,9 +30,10 @@ impl IntoResponse for ApiError {
             // The node accepted the connection but rejected the request
             // (bad address, orphan/rejected tx, missing --utxoindex, ...).
             ApiError::Node(NodeError::Rpc(m)) => (StatusCode::BAD_REQUEST, m),
-            ApiError::Node(NodeError::Timeout) => {
-                (StatusCode::GATEWAY_TIMEOUT, "keryx node request timed out".into())
-            }
+            ApiError::Node(NodeError::Timeout) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "keryx node request timed out".into(),
+            ),
             ApiError::Node(NodeError::Unreachable(m)) => (StatusCode::SERVICE_UNAVAILABLE, m),
             ApiError::Node(NodeError::Protocol(m)) => (StatusCode::BAD_GATEWAY, m),
         };

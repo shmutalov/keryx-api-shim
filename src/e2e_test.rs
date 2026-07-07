@@ -48,7 +48,7 @@ impl MockNode {
             }
             Req::GetCoinSupplyRequest(_) => {
                 Resp::GetCoinSupplyResponse(proto::GetCoinSupplyResponseMessage {
-                    max_sompi: 10_000_000_000_000_000,      // 100M KRX
+                    max_sompi: 10_000_000_000_000_000,        // 100M KRX
                     circulating_sompi: 2_500_000_000_000_000, // 25M KRX
                     error: None,
                 })
@@ -141,14 +141,16 @@ impl MockNode {
             }
             other => panic!("mock node got an unexpected request: {other:?}"),
         };
-        KaspadResponse { id: request.id, payload: Some(payload) }
+        KaspadResponse {
+            id: request.id,
+            payload: Some(payload),
+        }
     }
 }
 
 #[tonic::async_trait]
 impl Rpc for MockNode {
-    type MessageStreamStream =
-        Pin<Box<dyn Stream<Item = Result<KaspadResponse, Status>> + Send>>;
+    type MessageStreamStream = Pin<Box<dyn Stream<Item = Result<KaspadResponse, Status>> + Send>>;
 
     async fn message_stream(
         &self,
@@ -177,7 +179,9 @@ async fn spawn_stack() -> (String, Arc<Mutex<Option<proto::RpcTransaction>>>) {
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(RpcServer::new(mock))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(node_listener))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                node_listener,
+            ))
             .await
             .unwrap();
     });
@@ -215,14 +219,26 @@ async fn wallet_contract_end_to_end() {
     let address = test_address();
 
     // /health
-    let health: serde_json::Value =
-        http.get(format!("{base}/health")).send().await.unwrap().json().await.unwrap();
+    let health: serde_json::Value = http
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(health["status"], "ok");
     assert_eq!(health["node"]["has_utxo_index"], true);
 
     // /api/v1/info — exact field names the wallet reads.
-    let info: serde_json::Value =
-        http.get(format!("{base}/api/v1/info")).send().await.unwrap().json().await.unwrap();
+    let info: serde_json::Value = http
+        .get(format!("{base}/api/v1/info"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(info["network"], "keryx-simnet");
     assert_eq!(info["last_daa_score"], 123_456);
     assert_eq!(info["total_blocks"], 1000);
@@ -289,7 +305,9 @@ async fn wallet_contract_end_to_end() {
 
     // /addresses/{addr} — phase-1 stub must stay well-formed.
     let history: serde_json::Value = http
-        .get(format!("{base}/api/v1/addresses/{address}?limit=15&offset=0"))
+        .get(format!(
+            "{base}/api/v1/addresses/{address}?limit=15&offset=0"
+        ))
         .send()
         .await
         .unwrap()
@@ -331,22 +349,57 @@ async fn wallet_contract_end_to_end() {
         .json()
         .await
         .unwrap();
-    assert_eq!(broadcast, serde_json::json!({ "transaction_id": BROADCAST_TXID }));
-    let sent = submitted.lock().unwrap().clone().expect("mock saw the transaction");
+    assert_eq!(
+        broadcast,
+        serde_json::json!({ "transaction_id": BROADCAST_TXID })
+    );
+    let sent = submitted
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("mock saw the transaction");
     assert_eq!(sent.inputs[0].sequence, u64::MAX);
-    assert_eq!(sent.inputs[0].previous_outpoint.as_ref().unwrap().transaction_id, TXID);
+    assert_eq!(
+        sent.inputs[0]
+            .previous_outpoint
+            .as_ref()
+            .unwrap()
+            .transaction_id,
+        TXID
+    );
     assert_eq!(sent.outputs[0].amount, 12345);
-    assert_eq!(sent.outputs[0].script_public_key.as_ref().unwrap().script_public_key, "20aa11ac");
+    assert_eq!(
+        sent.outputs[0]
+            .script_public_key
+            .as_ref()
+            .unwrap()
+            .script_public_key,
+        "20aa11ac"
+    );
 
     // Inference stubs: well-formed empty lists.
-    for path in ["/api/v1/capabilities", "/api/v1/infer?limit=10", "/api/v1/challenges?limit=50"] {
-        let v: serde_json::Value =
-            http.get(format!("{base}{path}")).send().await.unwrap().json().await.unwrap();
+    for path in [
+        "/api/v1/capabilities",
+        "/api/v1/infer?limit=10",
+        "/api/v1/challenges?limit=50",
+    ] {
+        let v: serde_json::Value = http
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(v, serde_json::json!([]));
     }
 
     // Unconfigured market + errors keep the wallet's { error } shape.
-    let resp = http.get(format!("{base}/api/v1/market")).send().await.unwrap();
+    let resp = http
+        .get(format!("{base}/api/v1/market"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
     assert!(resp.json::<serde_json::Value>().await.unwrap()["error"].is_string());
 

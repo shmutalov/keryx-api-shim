@@ -26,7 +26,9 @@ fn flex_u64<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
             u64::try_from(v).map_err(|_| E::custom("value must not be negative"))
         }
         fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<u64, E> {
-            s.trim().parse().map_err(|_| E::custom(format!("invalid u64 string {s:?}")))
+            s.trim()
+                .parse()
+                .map_err(|_| E::custom(format!("invalid u64 string {s:?}")))
         }
     }
     d.deserialize_any(V)
@@ -172,7 +174,9 @@ impl TxJson {
         }
         for (i, output) in self.outputs.iter().enumerate() {
             if output.script_public_key.is_empty() || !is_hex(&output.script_public_key) {
-                return Err(format!("output {i}: script_public_key must be non-empty hex"));
+                return Err(format!(
+                    "output {i}: script_public_key must be non-empty hex"
+                ));
             }
         }
         Ok(())
@@ -298,7 +302,10 @@ mod tests {
         let spk = output.script_public_key.as_ref().unwrap();
         assert_eq!(spk.version, 0);
         assert_eq!(spk.script_public_key, "20aa11ac");
-        assert_eq!(rpc.subnetwork_id, "0000000000000000000000000000000000000000");
+        assert_eq!(
+            rpc.subnetwork_id,
+            "0000000000000000000000000000000000000000"
+        );
         assert_eq!(rpc.mass, 0);
     }
 

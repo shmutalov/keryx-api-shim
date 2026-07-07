@@ -13,7 +13,11 @@ pub struct Config {
     pub listen: SocketAddr,
 
     /// keryxd gRPC endpoint (node must run with --utxoindex).
-    #[arg(long, env = "KERYX_SHIM_NODE_GRPC", default_value = "http://127.0.0.1:22110")]
+    #[arg(
+        long,
+        env = "KERYX_SHIM_NODE_GRPC",
+        default_value = "http://127.0.0.1:22110"
+    )]
     pub node_grpc: String,
 
     /// Per-request timeout towards the node, in seconds. Keep well under the

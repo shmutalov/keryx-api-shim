@@ -59,7 +59,10 @@ pub struct NodeClient {
 macro_rules! rpc_method {
     ($name:ident, $req_variant:ident, $resp_variant:ident, $req:ty, $resp:ty) => {
         pub async fn $name(&self, req: $req) -> Result<$resp, NodeError> {
-            match self.call(kaspad_request::Payload::$req_variant(req)).await? {
+            match self
+                .call(kaspad_request::Payload::$req_variant(req))
+                .await?
+            {
                 kaspad_response::Payload::$resp_variant(resp) => {
                     if let Some(e) = resp.error.as_ref().filter(|e| !e.message.is_empty()) {
                         Err(NodeError::Rpc(e.message.clone()))
@@ -170,9 +173,9 @@ async fn actor(url: String, mut cmd_rx: mpsc::Receiver<Cmd>) {
                 tracing::debug!("connect to keryxd failed: {e}");
                 // Fail queued callers fast instead of letting them ride out their timeout.
                 while let Ok(cmd) = cmd_rx.try_recv() {
-                    let _ = cmd
-                        .reply
-                        .send(Err(NodeError::Unreachable(format!("cannot reach keryx node: {e}"))));
+                    let _ = cmd.reply.send(Err(NodeError::Unreachable(format!(
+                        "cannot reach keryx node: {e}"
+                    ))));
                 }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(RECONNECT_MAX);
@@ -250,6 +253,8 @@ async fn serve(channel: Channel, cmd_rx: &mut mpsc::Receiver<Cmd>) -> Option<()>
 
 fn fail_all(pending: &mut HashMap<u64, Reply>) {
     for (_, reply) in pending.drain() {
-        let _ = reply.send(Err(NodeError::Unreachable("connection to node lost".into())));
+        let _ = reply.send(Err(NodeError::Unreachable(
+            "connection to node lost".into(),
+        )));
     }
 }
