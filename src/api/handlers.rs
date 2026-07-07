@@ -72,6 +72,15 @@ async fn build_info(app: AppState) -> Result<dto::InfoResponse, ApiError> {
 
     let circulating = supply.circulating_sompi as f64 / dto::SOMPI_PER_KRX;
     let max_supply = supply.max_sompi as f64 / dto::SOMPI_PER_KRX;
+    // total_txs comes from the indexer's counter when enabled (it counts only
+    // transactions seen since the indexer started, not the whole chain's
+    // history); 0 otherwise.
+    let total_txs = app
+        .indexer
+        .as_ref()
+        .and_then(|h| h.store())
+        .and_then(|s| s.total_txs().ok())
+        .unwrap_or(0);
     Ok(dto::InfoResponse {
         network: dag.network_name,
         last_daa_score: dag.virtual_daa_score,
@@ -80,8 +89,8 @@ async fn build_info(app: AppState) -> Result<dto::InfoResponse, ApiError> {
         max_supply_krx: max_supply,
         hashrate_hps,
         total_blocks: dag.block_count,
-        // These four need the address/tx indexer (future phase); zeroed until then.
-        total_txs: 0,
+        total_txs,
+        // These three still need deeper indexing (escrow/burn accounting); 0 for now.
         burned_krx: 0.0,
         total_escrow_krx: 0.0,
         total_real_inferences: 0,
@@ -179,27 +188,161 @@ async fn fetch_utxos(app: &AppState, address: String) -> Result<Vec<dto::UtxoDto
 
 #[derive(Deserialize)]
 pub struct HistoryQuery {
-    #[allow(dead_code)]
     limit: Option<usize>,
-    #[allow(dead_code)]
     offset: Option<usize>,
 }
 
-/// Phase 1: the shim is deliberately not an indexer, and a bare keryxd keeps
-/// no per-address transaction history. A well-formed empty page keeps the
-/// wallet's dashboard and history views functional; the indexer phase will
-/// replace this handler.
+const HISTORY_MAX_LIMIT: usize = 1000;
+
+/// Per-address transaction history. Served from the indexer's window when it is
+/// enabled; otherwise a well-formed empty page (a bare keryxd keeps no
+/// per-address history), which keeps the wallet's dashboard and history views
+/// functional. `history_since_daa` lets a client distinguish "no transactions"
+/// from "none within the retention window".
 pub async fn address_history(
+    State(app): State<AppState>,
     Path(address): Path<String>,
-    Query(_query): Query<HistoryQuery>,
+    Query(query): Query<HistoryQuery>,
 ) -> Result<Json<dto::AddressHistoryResponse>, ApiError> {
     dto::validate_address(&address).map_err(ApiError::BadRequest)?;
+
+    let Some(store) = app.indexer.as_ref().and_then(|h| h.store()) else {
+        return Ok(Json(dto::AddressHistoryResponse {
+            address,
+            total_received_sompi: 0,
+            total_tx_count: 0,
+            transactions: vec![],
+            history_since_daa: None,
+        }));
+    };
+
+    let limit = query.limit.unwrap_or(10).clamp(1, HISTORY_MAX_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let rows = store.address_history(&address, limit, offset)?;
+    let (total_received_sompi, total_tx_count) = store.address_totals(&address)?;
+    let history_since_daa = store.window_low_daa()?;
+    let transactions = rows
+        .into_iter()
+        .map(|r| dto::HistoryTx {
+            tx_id: r.tx_id,
+            amount_sompi: r.amount_sompi,
+            is_spend: r.is_spend,
+            daa_score: r.daa_score,
+            block_hash: r.block_hash,
+            address: address.clone(),
+        })
+        .collect();
     Ok(Json(dto::AddressHistoryResponse {
         address,
-        total_received_sompi: 0,
-        total_tx_count: 0,
-        transactions: vec![],
+        total_received_sompi,
+        total_tx_count,
+        transactions,
+        history_since_daa,
     }))
+}
+
+// --- /api/v1/transactions/{id} and /api/v1/outpoints/{txid}/{index}/spend ------------
+
+fn is_txid(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Render an indexed transaction in the wallet's wire shape plus acceptance
+/// metadata. `payload` is included verbatim (swap-recovery reads redeem-script
+/// hints from funding-tx payloads).
+fn tx_to_json(itx: &crate::indexer::store::IndexedTx) -> Value {
+    Value::Object(serde_json::Map::from_iter([
+        ("tx_id".into(), json!(itx.tx_id)),
+        ("version".into(), json!(itx.version)),
+        (
+            "inputs".into(),
+            Value::Array(
+                itx.inputs
+                    .iter()
+                    .map(|i| {
+                        json!({
+                            "transaction_id": i.previous_tx_id,
+                            "index": i.previous_index,
+                            "signature_script": i.signature_script,
+                            // u64::MAX exceeds JS safe ints; match the wallet and emit a string.
+                            "sequence": i.sequence.to_string(),
+                            "sig_op_count": i.sig_op_count,
+                        })
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "outputs".into(),
+            Value::Array(
+                itx.outputs
+                    .iter()
+                    .map(|o| {
+                        json!({
+                            "amount": o.amount,
+                            "script_version": o.script_version,
+                            "script_public_key": o.script_public_key,
+                        })
+                    })
+                    .collect(),
+            ),
+        ),
+        ("lock_time".into(), json!(itx.lock_time)),
+        ("subnetwork_id".into(), json!(itx.subnetwork_id)),
+        ("gas".into(), json!(itx.gas)),
+        ("payload".into(), json!(itx.payload)),
+        ("block_hash".into(), json!(itx.accepting_block_hash)),
+        ("daa_score".into(), json!(itx.accepting_daa)),
+        ("is_coinbase".into(), json!(itx.is_coinbase)),
+    ]))
+}
+
+fn require_index(app: &AppState) -> Result<&crate::indexer::store::Store, ApiError> {
+    app.indexer
+        .as_ref()
+        .and_then(|h| h.store())
+        .ok_or_else(|| ApiError::NotFound("transaction index is not enabled on this shim".into()))
+}
+
+pub async fn transaction(
+    State(app): State<AppState>,
+    Path(tx_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if !is_txid(&tx_id) {
+        return Err(ApiError::BadRequest(
+            "transaction id must be 64 hex chars".into(),
+        ));
+    }
+    let store = require_index(&app)?;
+    match store.tx_by_id(&tx_id)? {
+        Some(itx) => Ok(Json(tx_to_json(&itx))),
+        None => Err(ApiError::NotFound(
+            "transaction not found within the indexer window".into(),
+        )),
+    }
+}
+
+/// The transaction that spent a given outpoint — the HTLC preimage-extraction
+/// path (the preimage is a push in the spending tx's `signature_script`).
+pub async fn outpoint_spend(
+    State(app): State<AppState>,
+    Path((tx_id, index)): Path<(String, u32)>,
+) -> Result<Json<Value>, ApiError> {
+    if !is_txid(&tx_id) {
+        return Err(ApiError::BadRequest(
+            "transaction id must be 64 hex chars".into(),
+        ));
+    }
+    let store = require_index(&app)?;
+    match store.spend_of(&tx_id, index)? {
+        Some(itx) => Ok(Json(json!({
+            "status": "accepted",
+            "transaction": tx_to_json(&itx),
+        }))),
+        None => Err(ApiError::NotFound(
+            "outpoint has no known spending transaction in the indexer window".into(),
+        )),
+    }
 }
 
 // --- /api/v1/broadcast --------------------------------------------------------------

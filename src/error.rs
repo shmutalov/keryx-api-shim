@@ -12,6 +12,7 @@ pub enum ApiError {
     BadRequest(String),
     NotFound(String),
     Upstream(String),
+    Internal(String),
     Node(NodeError),
 }
 
@@ -21,12 +22,19 @@ impl From<NodeError> for ApiError {
     }
 }
 
+impl From<crate::indexer::store::StoreError> for ApiError {
+    fn from(e: crate::indexer::store::StoreError) -> Self {
+        ApiError::Internal(e.to_string())
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Upstream(m) => (StatusCode::BAD_GATEWAY, m),
+            ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
             // The node accepted the connection but rejected the request
             // (bad address, orphan/rejected tx, missing --utxoindex, ...).
             ApiError::Node(NodeError::Rpc(m)) => (StatusCode::BAD_REQUEST, m),

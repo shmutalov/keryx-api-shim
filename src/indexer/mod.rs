@@ -1,35 +1,40 @@
-//! Windowed indexer — M1 pipeline skeleton.
+//! Windowed indexer — the durable chain follower (M2).
 //!
 //! A single task follows keryxd's virtual selected-parent chain and folds
-//! accepted transactions into an [`IndexStore`], maintaining a checkpoint and a
-//! monotonic tx counter. It is fed by [`Notification`]s from the node client:
+//! accepted transactions into a redb-backed [`Store`], maintaining a
+//! checkpoint, per-address history, an outpoint→spender index, and monotonic
+//! counters. Fed by [`Notification`]s from the node client:
 //!
-//! - `Connected` → (re)subscribe and gap-backfill from the checkpoint to tip.
-//! - `BlockAdded` → stage block bodies (join source for acceptance).
-//! - `VirtualChainChanged` → apply the accepted transactions of each added
-//!   chain block, advancing the checkpoint.
+//! - `Connected` → open the store (first time), (re)subscribe, gap-backfill.
+//! - `BlockAdded` → stage full block bodies (the join source for acceptance).
+//! - `VirtualChainChanged` → unwind removed chain blocks, then apply the
+//!   accepted transactions of each added chain block.
 //!
-//! M1 is linear-chain only: reorgs (removed chain blocks) are logged but not
-//! unwound, and the store is in-memory. M2 adds the durable, DAA-segmented
-//! store and reorg unwind; M3 adds the address ledger and read endpoints.
+//! Retention is a periodic sweep dropping rows below the DAA window; reorgs are
+//! unwound via the store's `accepted_by` list. Everything is crash-safe: each
+//! apply is one redb transaction and restart resumes from the committed
+//! checkpoint (idempotent by chain-block hash).
 
-mod store;
+pub mod address;
+pub mod store;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::node::{proto, NodeClient, NodeError, Notification};
-use store::{IndexStore, MemStore};
+use store::{AcceptedGroup, RawIn, RawOut, RawTx, Store};
 
-/// Recently-added blocks kept in RAM so acceptance can be joined to a DAA
-/// score (and accepted tx ids matched against what we actually saw) without a
-/// node round-trip. Both maps are bounded; at 10 bps these caps cover minutes
-/// between a block being added and the chain block that accepts it.
-const STAGE_BLOCK_CAP: usize = 50_000;
-const STAGE_TX_CAP: usize = 500_000;
+const STAGE_BLOCK_CAP: usize = 20_000;
+const STAGE_TX_CAP: usize = 50_000;
+/// ~10 bps → sweep expiry roughly every 90 s of chain time.
+const EXPIRE_INTERVAL_DAA: u64 = 900;
+const DAA_PER_DAY: u64 = 864_000;
+/// Kaspa/Keryx coinbase subnetwork id.
+const COINBASE_SUBNETWORK: &str = "0100000000000000000000000000000000000000";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexerState {
@@ -53,28 +58,37 @@ struct IndexerStatus {
     state: IndexerState,
     window_days: u64,
     checkpoint_daa: Option<u64>,
+    window_low_daa: Option<u64>,
     total_txs: u64,
-    applied_blocks: u64,
+    chain_blocks: u64,
     resolve_misses: u64,
     staged_blocks: usize,
     generation: u64,
 }
 
-/// Cheap-to-clone read handle for `/health` (and, from M3, indexed reads).
+/// Cheap-to-clone handle: read-only status for `/health` plus access to the
+/// store for the indexed read endpoints (M3).
 #[derive(Clone)]
 pub struct IndexerHandle {
     status: Arc<RwLock<IndexerStatus>>,
+    store: Arc<OnceLock<Store>>,
 }
 
 impl IndexerHandle {
+    /// The store, once the indexer has learned the network and opened it.
+    pub fn store(&self) -> Option<&Store> {
+        self.store.get()
+    }
+
     pub fn json(&self) -> Value {
         let s = self.status.read().unwrap();
         json!({
             "state": s.state.as_str(),
             "window_days": s.window_days,
             "checkpoint_daa": s.checkpoint_daa,
+            "window_low_daa": s.window_low_daa,
             "total_txs": s.total_txs,
-            "applied_blocks": s.applied_blocks,
+            "chain_blocks": s.chain_blocks,
             "resolve_misses": s.resolve_misses,
             "staged_blocks": s.staged_blocks,
             "generation": s.generation,
@@ -82,28 +96,29 @@ impl IndexerHandle {
     }
 }
 
-/// Spawn the indexer task. Returns immediately with a status handle; the task
-/// starts working once the node reports `Connected`.
 pub fn spawn(
     node: NodeClient,
     notifs: mpsc::Receiver<Notification>,
     window_days: u64,
+    data_dir: PathBuf,
 ) -> IndexerHandle {
     let status = Arc::new(RwLock::new(IndexerStatus {
         state: IndexerState::Connecting,
         window_days,
         checkpoint_daa: None,
+        window_low_daa: None,
         total_txs: 0,
-        applied_blocks: 0,
+        chain_blocks: 0,
         resolve_misses: 0,
         staged_blocks: 0,
         generation: 0,
     }));
-    let store: Arc<dyn IndexStore> = Arc::new(MemStore::new());
+    let store = Arc::new(OnceLock::new());
     let handle = IndexerHandle {
         status: status.clone(),
+        store: store.clone(),
     };
-    tokio::spawn(run(node, notifs, store, status));
+    tokio::spawn(run(node, notifs, status, store, data_dir, window_days));
     handle
 }
 
@@ -111,13 +126,28 @@ fn edit(status: &RwLock<IndexerStatus>, f: impl FnOnce(&mut IndexerStatus)) {
     f(&mut status.write().unwrap());
 }
 
+/// Mutable per-run bookkeeping threaded through the apply paths.
+struct Ctx {
+    window_daa: u64,
+    last_expire_daa: u64,
+    total_misses: u64,
+}
+
 async fn run(
     node: NodeClient,
     mut notifs: mpsc::Receiver<Notification>,
-    store: Arc<dyn IndexStore>,
     status: Arc<RwLock<IndexerStatus>>,
+    store_cell: Arc<OnceLock<Store>>,
+    data_dir: PathBuf,
+    window_days: u64,
 ) {
     let mut staging = Staging::new();
+    let mut ctx = Ctx {
+        window_daa: window_days.saturating_mul(DAA_PER_DAY),
+        last_expire_daa: 0,
+        total_misses: 0,
+    };
+
     while let Some(notification) = notifs.recv().await {
         match notification {
             Notification::Connected { generation } => {
@@ -125,19 +155,33 @@ async fn run(
                     s.state = IndexerState::Connecting;
                     s.generation = generation;
                 });
+                if store_cell.get().is_none() {
+                    match open_store(&node, &data_dir).await {
+                        Ok(store) => {
+                            let _ = store_cell.set(store);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "indexer: cannot open store: {e}; retrying next connect"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let store = store_cell.get().expect("store just opened");
                 if let Err(e) = subscribe(&node).await {
                     tracing::warn!("indexer: subscribe failed on generation {generation}: {e}");
-                    continue; // the next Connected will retry
+                    continue;
                 }
                 edit(&status, |s| s.state = IndexerState::Backfilling);
-                if let Err(e) = backfill(&node, store.as_ref(), &mut staging, &status).await {
+                if let Err(e) = backfill(&node, store, &mut staging, &status, &mut ctx).await {
                     tracing::warn!("indexer: backfill failed: {e}; relying on live stream");
                 }
                 edit(&status, |s| s.state = IndexerState::Live);
                 tracing::info!(
-                    "indexer live at generation {generation}: {} txs across {} chain blocks",
-                    store.total_txs(),
-                    store.applied_blocks()
+                    "indexer live at generation {generation}: {} txs, checkpoint DAA {:?}",
+                    store.total_txs().unwrap_or(0),
+                    store.checkpoint().ok().flatten().map(|c| c.daa_score)
                 );
             }
             Notification::BlockAdded(block) => {
@@ -146,26 +190,40 @@ async fn run(
                 edit(&status, |s| s.staged_blocks = staged);
             }
             Notification::VirtualChainChanged(vc) => {
-                if !vc.removed_chain_block_hashes.is_empty() {
-                    // M1 is linear-only. A reorg here means our checkpoint may
-                    // include now-orphaned blocks until M2 adds unwind.
-                    tracing::warn!(
-                        "indexer: chain reorg removed {} block(s); unwind lands in M2",
-                        vc.removed_chain_block_hashes.len()
-                    );
+                let Some(store) = store_cell.get() else {
+                    continue;
+                };
+                // Reorg: unwind removed chain blocks (given high-to-low) first.
+                for hash in &vc.removed_chain_block_hashes {
+                    match store.unwind_chain_block(hash) {
+                        Ok(n) if n > 0 => {
+                            tracing::warn!("indexer: unwound {n} txs from reorged block {hash}")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!("indexer: unwind failed for {hash}: {e}"),
+                    }
                 }
-                apply_accepted(
-                    &node,
-                    store.as_ref(),
-                    &mut staging,
-                    &status,
-                    &vc.accepted_transaction_ids,
-                )
-                .await;
+                let (groups, misses) =
+                    build_groups(&node, &staging, &vc.accepted_transaction_ids).await;
+                apply_groups(store, groups, misses, &status, &mut ctx);
             }
         }
     }
     tracing::info!("indexer: node notification stream closed; stopping");
+}
+
+async fn open_store(node: &NodeClient, data_dir: &std::path::Path) -> Result<Store, String> {
+    let network = node
+        .get_block_dag_info(proto::GetBlockDagInfoRequestMessage {})
+        .await
+        .map(|d| d.network_name)
+        .unwrap_or_default();
+    let prefix = address::prefix_for_network(&network);
+    tracing::info!(
+        "indexer: opening store at {} (prefix {prefix})",
+        data_dir.display()
+    );
+    Store::open(data_dir, prefix).map_err(|e| e.to_string())
 }
 
 async fn subscribe(node: &NodeClient) -> Result<(), NodeError> {
@@ -180,16 +238,14 @@ async fn subscribe(node: &NodeClient) -> Result<(), NodeError> {
     Ok(())
 }
 
-/// Catch up from the checkpoint (or the current sink on a fresh index) to the
-/// virtual tip. One `getVirtualChainFromBlock` returns the whole added range;
-/// `getBlocks` from its low hash stages the bodies so DAA resolves locally.
 async fn backfill(
     node: &NodeClient,
-    store: &dyn IndexStore,
+    store: &Store,
     staging: &mut Staging,
     status: &RwLock<IndexerStatus>,
+    ctx: &mut Ctx,
 ) -> Result<(), NodeError> {
-    let start = match store.checkpoint() {
+    let start = match store.checkpoint().ok().flatten() {
         Some(cp) => cp.chain_block_hash,
         None => {
             node.get_block_dag_info(proto::GetBlockDagInfoRequestMessage {})
@@ -227,45 +283,87 @@ async fn backfill(
         }
     }
 
-    apply_accepted(node, store, staging, status, &vc.accepted_transaction_ids).await;
+    let (groups, misses) = build_groups(node, staging, &vc.accepted_transaction_ids).await;
+    apply_groups(store, groups, misses, status, ctx);
     Ok(())
 }
 
-/// Fold each accepting chain block's accepted transactions into the store.
-/// Order-preserving (groups arrive low-to-high) so the checkpoint advances
-/// monotonically; the store dedupes by hash so overlap is harmless.
-async fn apply_accepted(
+/// Turn the node's acceptance lists into ready-to-apply groups, pulling each
+/// accepted tx body from staging. A staged miss (tx body not seen) is counted
+/// and skipped — rare, and confined to the startup boundary.
+async fn build_groups(
     node: &NodeClient,
-    store: &dyn IndexStore,
-    staging: &mut Staging,
-    status: &RwLock<IndexerStatus>,
-    groups: &[proto::RpcAcceptedTransactionIds],
-) {
-    for group in groups {
-        let hash = &group.accepting_block_hash;
-        let count = group.accepted_transaction_ids.len() as u64;
-        let resolved = group
-            .accepted_transaction_ids
-            .iter()
-            .filter(|id| staging.saw_tx(id))
-            .count() as u64;
-        let daa = match staging.block_daa(hash) {
+    staging: &Staging,
+    accepted: &[proto::RpcAcceptedTransactionIds],
+) -> (Vec<AcceptedGroup>, u64) {
+    let mut groups = Vec::with_capacity(accepted.len());
+    let mut misses = 0u64;
+    for a in accepted {
+        let daa = match staging.block_daa(&a.accepting_block_hash) {
             Some(daa) => daa,
-            None => resolve_daa(node, hash).await,
+            None => resolve_daa(node, &a.accepting_block_hash).await,
         };
-        if store.apply_chain_block(hash, daa, count) {
-            let total = store.total_txs();
-            let blocks = store.applied_blocks();
-            let staged = staging.blocks();
-            edit(status, |s| {
-                s.checkpoint_daa = Some(daa);
-                s.total_txs = total;
-                s.applied_blocks = blocks;
-                s.resolve_misses += count - resolved;
-                s.staged_blocks = staged;
-            });
+        let mut txs = Vec::with_capacity(a.accepted_transaction_ids.len());
+        for id in &a.accepted_transaction_ids {
+            match staging.get_tx(id) {
+                Some(raw) => txs.push(raw),
+                None => misses += 1,
+            }
         }
+        groups.push(AcceptedGroup {
+            chain_block_hash: a.accepting_block_hash.clone(),
+            daa_score: daa,
+            txs,
+        });
     }
+    (groups, misses)
+}
+
+fn apply_groups(
+    store: &Store,
+    groups: Vec<AcceptedGroup>,
+    misses: u64,
+    status: &RwLock<IndexerStatus>,
+    ctx: &mut Ctx,
+) {
+    if groups.is_empty() {
+        return;
+    }
+    let stats = match store.apply(&groups) {
+        Ok(stats) => stats,
+        Err(e) => {
+            tracing::error!("indexer: apply failed: {e}");
+            return;
+        }
+    };
+    ctx.total_misses += misses;
+
+    // Retention sweep, rate-limited so we don't scan every block.
+    if ctx.window_daa > 0
+        && stats.checkpoint_daa > ctx.window_daa
+        && stats.checkpoint_daa >= ctx.last_expire_daa + EXPIRE_INTERVAL_DAA
+    {
+        let cutoff = stats.checkpoint_daa - ctx.window_daa;
+        match store.expire_below(cutoff) {
+            Ok(n) if n > 0 => tracing::debug!("indexer: expired {n} txs below DAA {cutoff}"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("indexer: expiry failed: {e}"),
+        }
+        ctx.last_expire_daa = stats.checkpoint_daa;
+    }
+
+    let checkpoint_daa = store.checkpoint().ok().flatten().map(|c| c.daa_score);
+    let window_low_daa = store.window_low_daa().ok().flatten();
+    let chain_blocks = store.chain_blocks().unwrap_or(0);
+    let total_misses = ctx.total_misses;
+    edit(status, |s| {
+        s.checkpoint_daa = checkpoint_daa;
+        s.window_low_daa = window_low_daa;
+        s.total_txs = stats.total_txs;
+        s.chain_blocks = chain_blocks;
+        s.resolve_misses = total_misses;
+        s.staged_blocks = 0; // refreshed on the next BlockAdded
+    });
 }
 
 async fn resolve_daa(node: &NodeClient, hash: &str) -> u64 {
@@ -286,6 +384,51 @@ async fn resolve_daa(node: &NodeClient, hash: &str) -> u64 {
             0
         }
     }
+}
+
+fn raw_from_proto(tx: &proto::RpcTransaction) -> Option<RawTx> {
+    let tx_id = tx.verbose_data.as_ref()?.transaction_id.clone();
+    if tx_id.is_empty() {
+        return None;
+    }
+    let is_coinbase = tx.subnetwork_id.eq_ignore_ascii_case(COINBASE_SUBNETWORK);
+    let inputs = tx
+        .inputs
+        .iter()
+        .map(|i| {
+            let op = i.previous_outpoint.clone().unwrap_or_default();
+            RawIn {
+                previous_tx_id: op.transaction_id,
+                previous_index: op.index,
+                signature_script: i.signature_script.clone(),
+                sequence: i.sequence,
+                sig_op_count: i.sig_op_count,
+            }
+        })
+        .collect();
+    let outputs = tx
+        .outputs
+        .iter()
+        .map(|o| {
+            let spk = o.script_public_key.clone().unwrap_or_default();
+            RawOut {
+                amount: o.amount,
+                script_version: spk.version,
+                script_public_key: spk.script_public_key,
+            }
+        })
+        .collect();
+    Some(RawTx {
+        tx_id,
+        is_coinbase,
+        version: tx.version,
+        lock_time: tx.lock_time,
+        subnetwork_id: tx.subnetwork_id.clone(),
+        gas: tx.gas,
+        payload: tx.payload.clone(),
+        inputs,
+        outputs,
+    })
 }
 
 // --- staging ------------------------------------------------------------------
@@ -321,10 +464,6 @@ impl<V> Bounded<V> {
         self.map.get(key)
     }
 
-    fn contains(&self, key: &str) -> bool {
-        self.map.contains_key(key)
-    }
-
     fn len(&self) -> usize {
         self.map.len()
     }
@@ -332,14 +471,14 @@ impl<V> Bounded<V> {
 
 struct Staging {
     block_daa: Bounded<u64>,
-    seen_tx: Bounded<()>,
+    tx_bodies: Bounded<RawTx>,
 }
 
 impl Staging {
     fn new() -> Self {
         Self {
             block_daa: Bounded::new(STAGE_BLOCK_CAP),
-            seen_tx: Bounded::new(STAGE_TX_CAP),
+            tx_bodies: Bounded::new(STAGE_TX_CAP),
         }
     }
 
@@ -350,10 +489,8 @@ impl Staging {
             }
         }
         for tx in &block.transactions {
-            if let Some(vd) = &tx.verbose_data {
-                if !vd.transaction_id.is_empty() {
-                    self.seen_tx.insert(vd.transaction_id.clone(), ());
-                }
+            if let Some(raw) = raw_from_proto(tx) {
+                self.tx_bodies.insert(raw.tx_id.clone(), raw);
             }
         }
     }
@@ -362,8 +499,8 @@ impl Staging {
         self.block_daa.get(hash).copied()
     }
 
-    fn saw_tx(&self, tx_id: &str) -> bool {
-        self.seen_tx.contains(tx_id)
+    fn get_tx(&self, tx_id: &str) -> Option<RawTx> {
+        self.tx_bodies.get(tx_id).cloned()
     }
 
     fn blocks(&self) -> usize {
@@ -381,14 +518,13 @@ mod tests {
         b.insert("a".into(), 1);
         b.insert("b".into(), 2);
         b.insert("c".into(), 3);
-        assert!(!b.contains("a"));
-        assert!(b.contains("b"));
-        assert!(b.contains("c"));
+        assert!(b.get("a").is_none());
+        assert!(b.get("b").is_some());
         assert_eq!(b.len(), 2);
     }
 
     #[test]
-    fn staging_records_daa_and_tx_ids() {
+    fn stages_full_tx_bodies() {
         let mut staging = Staging::new();
         staging.stage_block(&proto::RpcBlock {
             header: Some(proto::RpcBlockHeader {
@@ -396,6 +532,15 @@ mod tests {
                 ..Default::default()
             }),
             transactions: vec![proto::RpcTransaction {
+                subnetwork_id: "00".repeat(20),
+                outputs: vec![proto::RpcTransactionOutput {
+                    amount: 777,
+                    script_public_key: Some(proto::RpcScriptPublicKey {
+                        version: 0,
+                        script_public_key: "2011ac".into(),
+                    }),
+                    verbose_data: None,
+                }],
                 verbose_data: Some(proto::RpcTransactionVerboseData {
                     transaction_id: "tx1".into(),
                     ..Default::default()
@@ -409,7 +554,8 @@ mod tests {
             pom_proof: None,
         });
         assert_eq!(staging.block_daa("blockA"), Some(4242));
-        assert!(staging.saw_tx("tx1"));
-        assert!(!staging.saw_tx("tx2"));
+        let raw = staging.get_tx("tx1").expect("staged");
+        assert_eq!(raw.outputs[0].amount, 777);
+        assert!(!raw.is_coinbase);
     }
 }

@@ -50,4 +50,8 @@ pub struct Config {
     /// swap app's recovery buffer, not just lock time.
     #[arg(long, env = "KERYX_SHIM_INDEXER_WINDOW_DAYS", default_value_t = 7)]
     pub indexer_window_days: u64,
+
+    /// Directory for the indexer's redb data file.
+    #[arg(long, env = "KERYX_SHIM_INDEXER_DIR", default_value = "./indexer-data")]
+    pub indexer_dir: std::path::PathBuf,
 }

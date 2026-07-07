@@ -41,6 +41,12 @@ pub fn router(state: AppState) -> Router {
             get(handlers::utxo_count),
         )
         .route("/api/v1/broadcast", post(handlers::broadcast))
+        // Indexed reads (phase 2). 404 when the indexer is disabled.
+        .route("/api/v1/transactions/{id}", get(handlers::transaction))
+        .route(
+            "/api/v1/outpoints/{txid}/{index}/spend",
+            get(handlers::outpoint_spend),
+        )
         .route("/api/v1/market", get(handlers::market))
         // AI-inference oracle endpoints — indexer phase; see handlers::empty_list.
         .route("/api/v1/capabilities", get(handlers::empty_list))

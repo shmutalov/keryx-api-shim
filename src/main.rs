@@ -33,7 +33,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to the indexer task; otherwise use the plain (notification-less) client.
     let (node, indexer) = if cfg.indexer {
         let (node, notifs) = node::NodeClient::spawn_indexed(cfg.node_grpc.clone(), node_timeout);
-        let handle = indexer::spawn(node.clone(), notifs, cfg.indexer_window_days);
+        let handle = indexer::spawn(
+            node.clone(),
+            notifs,
+            cfg.indexer_window_days,
+            cfg.indexer_dir.clone(),
+        );
         tracing::info!(
             "indexer enabled (window {} days); node must run --retention-period-days >= {}",
             cfg.indexer_window_days,

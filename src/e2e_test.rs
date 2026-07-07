@@ -321,7 +321,8 @@ async fn wallet_contract_end_to_end() {
             "address": address,
             "total_received_sompi": 0,
             "total_tx_count": 0,
-            "transactions": []
+            "transactions": [],
+            "history_since_daa": null
         })
     );
 

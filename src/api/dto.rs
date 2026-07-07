@@ -90,6 +90,12 @@ pub struct AddressHistoryResponse {
     pub total_received_sompi: u64,
     pub total_tx_count: u64,
     pub transactions: Vec<HistoryTx>,
+    /// Oldest DAA score the indexer's retention window still covers, so a
+    /// client can tell "no transactions" from "none within the window" and
+    /// point the user at an explorer for older history. `null` when the
+    /// indexer is disabled (this endpoint is then an empty stub). Additive —
+    /// the current wallet ignores unknown fields.
+    pub history_since_daa: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]

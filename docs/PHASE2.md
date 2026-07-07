@@ -195,10 +195,20 @@ node's retention is unknown/short.
    simnet stack: went live in ~6 s and tracked the tip with checkpoint,
    `total_txs`, and `applied_blocks` advancing in lockstep. Durable store and
    reorg unwind are M2.
-2. **M2 — window & reorgs:** DAA segments, expiry, `accepted_by` unwind,
-   crash-safe idempotent apply.
-3. **M3 — endpoints:** real history (+`history_since_daa`), `/transactions/{id}`,
-   `/outpoints/{txid}/{index}/spend`, `/info` + `/health` additions.
+2. **M2 — durable store & reorgs ✅ (2026-07-08):** redb-backed store
+   (`src/indexer/store.rs`), one write transaction per apply, idempotent by
+   chain-block hash; address attribution via a ported bech32 codec
+   (`src/indexer/address.rs`); `accepted_by` reorg unwind; retention sweep
+   below the DAA cutoff (monotonic counters preserved). Note: retention is a
+   bounded row-delete sweep, not physical segment-file drops — simpler and
+   correct; segment-file archiving stays a future option. Verified live:
+   crash-safe resume (kill -9 → checkpoint/counters continued from the
+   committed state, no re-index from scratch).
+3. **M3 — read endpoints ✅ (2026-07-08):** real history with
+   `history_since_daa`, `GET /transactions/{id}` (payload passthrough),
+   `GET /outpoints/{txid}/{index}/spend` (HTLC preimage path), `/info.total_txs`
+   from the indexer counter. Verified live on simnet against real coinbase
+   data (address attribution, coinbase detection, payload passthrough, 404s).
 4. **M4 — mempool overlay:** pending history entries + relay-time spend/preimage
    visibility.
 5. **M5 — hardening & release:** perf replay, crash tests, README/API docs,
