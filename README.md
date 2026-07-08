@@ -132,14 +132,29 @@ Operational notes:
 
 ## Pointing the wallet extension at the shim
 
-The extension pins its API origin in **two** places — both must change, then rebuild:
+Current wallet builds retarget at **runtime**: open **Settings → Network** and set the
+shim's URL (stored as `krx_api_base`; leave empty to reset to the official host). No
+rebuild, and you do **not** add the shim to `host_permissions` — a custom host is
+deliberately reached over ordinary CORS, so the shim's permissive
+`Access-Control-Allow-Origin: *` (on by default) is what makes it work. Two constraints:
 
-1. `src/lib/api.js` → `API_BASE`
-2. `manifest.json` → `host_permissions` (MV3 blocks all other origins)
+- **HTTPS unless loopback.** The extension is a secure context, so the browser blocks
+  plain-`http://` requests to any non-loopback host as mixed content;
+  `http://127.0.0.1` / `http://localhost` are exempt. The wallet's Settings field
+  rejects a non-loopback `http://` host for this reason — use `https://` for a remote
+  shim.
+- **Don't strip CORS at your proxy.** If you terminate TLS in front of the shim
+  (Caddy/nginx), ensure it preserves `Access-Control-Allow-Origin: *` and passes the
+  `OPTIONS` preflight through (the wallet's `POST /broadcast` sends
+  `Content-Type: application/json`, which triggers one). A proxy that drops either makes
+  every wallet request fail as an opaque "node unreachable".
 
-The extension requires HTTPS in production contexts; put the shim behind your TLS
-terminator (Caddy/nginx) — keryxd itself has no TLS/auth/rate limits, so keep the node
-loopback-bound and add those controls at or in front of the shim.
+To change the **baked-in default** host instead (so a fresh install points here without
+touching Settings), edit `src/lib/api.js` → `DEFAULT_API_BASE` and add the origin to
+`manifest.json` → `host_permissions`, then rebuild.
+
+keryxd itself has no TLS/auth/rate limits, so keep the node loopback-bound and add those
+controls at or in front of the shim.
 
 ## Development
 

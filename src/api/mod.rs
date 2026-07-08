@@ -54,9 +54,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/challenges", get(handlers::challenges))
         .route("/ipfs/{cid}", get(handlers::ipfs))
         .route("/health", get(handlers::health))
-        // The MV3 extension bypasses CORS via host_permissions; the permissive
-        // layer is for web-based dev tools hitting the shim directly.
-        .layer(CorsLayer::permissive())
+        // CORS is load-bearing for the wallet's custom-host setup, not just dev
+        // tools: the default host lives in the extension's host_permissions and
+        // is fetched with extension privileges (no CORS), but a host set via the
+        // wallet's Settings → Network is NOT in host_permissions, so its fetch
+        // falls back to ordinary CORS and works only because we answer with
+        // `Access-Control-Allow-Origin: *`. `allow_private_network` answers
+        // Chrome's Private Network Access preflight so a loopback shim
+        // (http://127.0.0.1:8787) keeps working as that check tightens.
+        .layer(CorsLayer::permissive().allow_private_network(true))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
