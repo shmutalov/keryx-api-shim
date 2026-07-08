@@ -86,7 +86,9 @@ Implemented against the wallet's real client (`src/lib/api.js`) and protocol not
 | `GET /api/v1/outpoints/{txid}/{index}/spend` | **indexer** or 404 | the spending tx (HTLC preimage is in its `signature_script`); `status: "mempool"` before mining, else `"accepted"` |
 | `POST /api/v1/broadcast` | `submitTransaction` | wallet wire JSON incl. string-encoded u64 `sequence`; `allowOrphan` always false |
 | `GET /api/v1/market` | proxied upstream or **404** | wallet catch-guards this and hides USD values |
-| `GET /api/v1/capabilities` `/infer` `/challenges` | **stub** `[]` | AI-inference oracle data (future phase 2c) |
+| `GET /api/v1/capabilities` | **indexer** or `[]` | models declared in coinbase `/ai:cap:` markers, with miner pubkeys/count/`last_seen_daa` |
+| `GET /api/v1/infer?limit&offset` | **indexer** or `[]` | AiRequest feed joined with responses; `payload_prefix`, `result` (IPFS CID), `result_text: null` (fetch via `/ipfs/{cid}`) |
+| `GET /api/v1/challenges?limit` | **indexer** or `[]` | fraud challenges; `fraud_proven` always `false` (node removed on-chain slashing in v1.2.3) |
 | `GET /ipfs/{cid}` | proxied gateway or **404** | CIDv0 only, 1 MiB cap |
 | `GET /health` | `getServerInfo` | shim + node health; `indexer` section (state, checkpoint/window DAA, counts) when enabled |
 
@@ -122,6 +124,11 @@ Operational notes:
 - Transaction history and the inference/market endpoints are the only ones that
   need indexing; balances, UTXOs, and broadcast are always served live from the
   node whether or not the indexer is on.
+- **AI inference oracle** (`/capabilities`, `/infer`, `/challenges`): the
+  indexer decodes the AI subnetwork txs (03/04/05) and coinbase capability
+  markers. Inference result *text* is off-chain — only the IPFS CID is on-chain,
+  fetched via `/ipfs/{cid}`. `fraud_proven` is always `false` (keryx-node
+  removed on-chain slashing in v1.2.3).
 
 ## Pointing the wallet extension at the shim
 

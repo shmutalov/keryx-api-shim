@@ -16,6 +16,7 @@
 //! checkpoint (idempotent by chain-block hash).
 
 pub mod address;
+pub mod inference;
 pub mod mempool;
 pub mod store;
 

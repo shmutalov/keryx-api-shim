@@ -241,14 +241,37 @@ tests) and keeps `--indexer` off-by-default until M5.
 `CsvPubKey` escrow-script detection) ride on the same ledger pass — cheap
 add-ons once M2 is stable.
 
-## 11. Phase 2c — inference oracle (research first)
+## 11. Phase 2c — inference oracle ✅ (2026-07-08, v0.3.0)
 
-Blocked on two questions in keryx-node before schema design:
-1. How miner **results** land on-chain (which tx form carries the IPFS CID /
-   `result`), and what `request_hash` is computed over (challenges correlate
-   via `request_hash_hex[..16] == payload_prefix`).
-2. Whether `/capabilities` derives from the block `pomProof` field
-   (Proof-of-Model witness; see `POM_CONSENSUS_SPEC.md` in keryx-node).
+Research resolved both questions (see the on-chain mechanics below); implemented
+in `src/indexer/inference.rs` (decoders) + inference tables in the store,
+extracted in the **same apply pass** as everything else (gated by the same
+per-block idempotency, so no double-indexing).
+
+On-chain mechanics (from keryx-node `inference/src/ai_payload.rs`):
+- Three subnetworks: **03** AiRequest (model_id, max_tokens, reward, fee,
+  prompt), **04** AiResponse (request_hash, IPFS CIDv0, length), **05**
+  AiChallenge (response_hash, proof_data = request_hash).
+- **`request_hash = BLAKE2b-512(payload)[0..32]`** (512 truncated over the raw
+  payload — not 256, not the tx id). `payload_prefix = request_hash_hex[..16]`.
+- Requests↔responses join on `request_hash`; the **result text is off-chain**
+  (only the CIDv0 is on-chain — clients fetch it via the shim's `/ipfs/{cid}`).
+- `/capabilities` comes from coinbase `extra_data` markers
+  (`/ai:cap:<model_id>,…/` + `/escrow:<pubkey>/`), aggregated per model.
+- **`fraud_proven` is always `false`**: keryx-node removed on-chain slashing in
+  v1.2.3, so no fraud is provable from consensus state. Documented in the
+  endpoint and the response.
+- PoM (`RpcBlock.pomProof`) is dormant (`pom_activation = never()`), so caps use
+  the coinbase markers, not PoM — forward-compatible if PoM activates.
+- No on-chain model-name registry; the shim mirrors the wallet's hardcoded
+  model_id→name table (`src/lib/models.js`).
+
+Endpoints served from the indexer (else `[]`): `/capabilities`, `/infer`
+(joined feed, `payload_prefix`, `result` CID, `result_text: null`),
+`/challenges`. Inference rows respect the retention window. Verified: store
+unit tests drive real AiRequest/Response/Challenge/coinbase payloads through
+`apply()` and assert all three reads + expiry; endpoints return well-formed
+`[]` live on the idle simnet (which runs no inference).
 
 ## 12. Open questions
 

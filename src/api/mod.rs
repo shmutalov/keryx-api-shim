@@ -48,10 +48,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::outpoint_spend),
         )
         .route("/api/v1/market", get(handlers::market))
-        // AI-inference oracle endpoints — indexer phase; see handlers::empty_list.
-        .route("/api/v1/capabilities", get(handlers::empty_list))
-        .route("/api/v1/infer", get(handlers::empty_list))
-        .route("/api/v1/challenges", get(handlers::empty_list))
+        // AI-inference oracle (phase 2c) — served from the indexer, else [].
+        .route("/api/v1/capabilities", get(handlers::capabilities))
+        .route("/api/v1/infer", get(handlers::infer))
+        .route("/api/v1/challenges", get(handlers::challenges))
         .route("/ipfs/{cid}", get(handlers::ipfs))
         .route("/health", get(handlers::health))
         // The MV3 extension bypasses CORS via host_permissions; the permissive

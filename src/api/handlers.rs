@@ -428,14 +428,108 @@ pub async fn market(State(app): State<AppState>) -> Result<Json<Value>, ApiError
     Ok(Json(value))
 }
 
-// --- inference endpoints (indexer phase) --------------------------------------------
+// --- inference endpoints (phase 2c) -------------------------------------------------
+//
+// The AI-inference oracle (`/capabilities`, `/infer`, `/challenges`),
+// reconstructed from the AI subnetwork transactions (03/04/05) and coinbase
+// capability markers by the indexer. Each degrades to `[]` when the indexer is
+// off or on any store error — the wallet's inference screen catch-guards these.
 
-/// `/capabilities`, `/infer` and `/challenges` describe the AI-inference
-/// oracle layer, which requires indexing AiRequest subnetwork transactions —
-/// future phase. Empty lists are the honest, well-formed "no data" answer the
-/// wallet's inference screen already handles.
-pub async fn empty_list() -> Json<Value> {
-    Json(json!([]))
+fn inference_store(app: &AppState) -> Option<&crate::indexer::store::Store> {
+    app.indexer.as_ref().and_then(|h| h.store())
+}
+
+fn model_name(model_id: &str) -> String {
+    crate::indexer::inference::model_key(model_id)
+        .map(String::from)
+        .unwrap_or_else(|| model_id.to_string())
+}
+
+pub async fn capabilities(State(app): State<AppState>) -> Json<Value> {
+    let Some(store) = inference_store(&app) else {
+        return Json(json!([]));
+    };
+    let caps = store.capabilities().unwrap_or_default();
+    Json(Value::Array(
+        caps.into_iter()
+            .map(|c| {
+                json!({
+                    "model": model_name(&c.model_id),
+                    "model_id_hex": c.model_id,
+                    "miner_count": c.miner_pubkeys.len(),
+                    "last_seen_daa": c.last_seen_daa,
+                    "miner_pubkeys": c.miner_pubkeys,
+                })
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct InferQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+pub async fn infer(State(app): State<AppState>, Query(q): Query<InferQuery>) -> Json<Value> {
+    let Some(store) = inference_store(&app) else {
+        return Json(json!([]));
+    };
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    let offset = q.offset.unwrap_or(0);
+    let feed = store.inference_feed(limit, offset).unwrap_or_default();
+    Json(Value::Array(
+        feed.into_iter()
+            .map(|(req, resp)| {
+                json!({
+                    "tx_id": req.tx_id,
+                    "model": model_name(&req.model_id),
+                    "prompt": req.prompt,
+                    "max_tokens": req.max_tokens,
+                    "inference_reward": req.inference_reward,
+                    "priority_fee": req.priority_fee,
+                    "daa_score": req.daa_score,
+                    "block_hash": req.block_hash,
+                    // first 16 hex of request_hash — what the wallet matches
+                    // against a challenge's request_hash_hex[..16].
+                    "payload_prefix": req.request_hash.chars().take(16).collect::<String>(),
+                    "result": resp.as_ref().map(|r| r.cid.clone()),
+                    // off-chain; the wallet fetches it via GET /ipfs/{cid}.
+                    "result_text": Value::Null,
+                    "result_block_hash": resp.as_ref().map(|r| r.result_block_hash.clone()),
+                })
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct ChallengeQuery {
+    limit: Option<usize>,
+}
+
+pub async fn challenges(
+    State(app): State<AppState>,
+    Query(q): Query<ChallengeQuery>,
+) -> Json<Value> {
+    let Some(store) = inference_store(&app) else {
+        return Json(json!([]));
+    };
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let list = store.challenges(limit).unwrap_or_default();
+    Json(Value::Array(
+        list.into_iter()
+            .map(|c| {
+                json!({
+                    "tx_id": c.tx_id,
+                    "request_hash_hex": c.request_hash,
+                    // keryx-node removed on-chain slashing in v1.2.3, so no
+                    // fraud is provable from consensus state — always false.
+                    "fraud_proven": false,
+                })
+            })
+            .collect(),
+    ))
 }
 
 // --- /ipfs/{cid} ------------------------------------------------------------------------

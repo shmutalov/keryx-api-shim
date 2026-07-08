@@ -20,6 +20,7 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use super::address::script_to_address;
+use super::inference;
 
 // u64 keyed
 const TX: TableDefinition<u64, &[u8]> = TableDefinition::new("tx");
@@ -34,6 +35,13 @@ const ADDR_TOTALS: TableDefinition<&str, &[u8]> = TableDefinition::new("addr_tot
 const ACCEPTED_BY: TableDefinition<&str, &[u8]> = TableDefinition::new("accepted_by");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta_u64");
 const META_STR: TableDefinition<&str, &str> = TableDefinition::new("meta_str");
+// AI inference subsystem (phase 2c)
+const AI_REQ: TableDefinition<u64, &[u8]> = TableDefinition::new("ai_req"); // req_seq -> AiRequestRec
+const AI_REQ_BY_HASH: TableDefinition<&str, u64> = TableDefinition::new("ai_req_by_hash"); // request_hash -> seq
+const AI_RESP: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_resp"); // request_hash -> AiResponseRec
+const AI_RESP_HASH: TableDefinition<&str, &str> = TableDefinition::new("ai_resp_hash"); // response_hash -> request_hash
+const AI_CHAL: TableDefinition<u64, &[u8]> = TableDefinition::new("ai_chal"); // chal_seq -> AiChallengeRec
+const AI_CAPS: TableDefinition<&[u8], u64> = TableDefinition::new("ai_caps"); // model_id||FF||pubkey -> last_seen_daa
 
 const SCHEMA_VERSION: u64 = 1;
 
@@ -152,6 +160,44 @@ pub struct HistRow {
     pub block_hash: String,
 }
 
+/// An indexed AI inference request (subnetwork 03), joined to its response
+/// (if seen) at read time.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AiRequestRec {
+    pub tx_id: String,
+    pub model_id: String,
+    pub max_tokens: u32,
+    pub inference_reward: u64,
+    pub priority_fee: u64,
+    pub prompt: String,
+    pub daa_score: u64,
+    pub block_hash: String,
+    pub request_hash: String,
+    pub miner_pubkey: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AiResponseRec {
+    pub cid: String,
+    pub result_block_hash: String,
+    pub response_length: u32,
+    pub daa_score: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AiChallengeRec {
+    pub tx_id: String,
+    pub request_hash: String,
+    pub daa_score: u64,
+}
+
+/// One row of `/capabilities`: a model and the miners that declared it.
+pub struct Capability {
+    pub model_id: String,
+    pub miner_pubkeys: Vec<String>,
+    pub last_seen_daa: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkpoint {
     pub chain_block_hash: String,
@@ -204,6 +250,14 @@ fn chain_key(daa: u64, hash: &str) -> Vec<u8> {
     k
 }
 
+fn caps_key(model_id: &str, pubkey: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(model_id.len() + 1 + pubkey.len());
+    k.extend_from_slice(model_id.as_bytes());
+    k.push(0xFF);
+    k.extend_from_slice(pubkey.as_bytes());
+    k
+}
+
 fn enc<T: Serialize>(v: &T) -> Vec<u8> {
     bincode::serialize(v).expect("bincode encode is infallible for our types")
 }
@@ -242,6 +296,12 @@ impl Store {
                 meta.insert("schema", SCHEMA_VERSION)?;
             }
             write.open_table(META_STR)?;
+            write.open_table(AI_REQ)?;
+            write.open_table(AI_REQ_BY_HASH)?;
+            write.open_table(AI_RESP)?;
+            write.open_table(AI_RESP_HASH)?;
+            write.open_table(AI_CHAL)?;
+            write.open_table(AI_CAPS)?;
         }
         write.commit()?;
         Ok(Self {
@@ -268,9 +328,17 @@ impl Store {
             let mut acc_t = write.open_table(ACCEPTED_BY)?;
             let mut meta = write.open_table(META)?;
             let mut meta_str = write.open_table(META_STR)?;
+            let mut ai_req_t = write.open_table(AI_REQ)?;
+            let mut ai_req_hash_t = write.open_table(AI_REQ_BY_HASH)?;
+            let mut ai_resp_t = write.open_table(AI_RESP)?;
+            let mut ai_resp_hash_t = write.open_table(AI_RESP_HASH)?;
+            let mut ai_chal_t = write.open_table(AI_CHAL)?;
+            let mut ai_caps_t = write.open_table(AI_CAPS)?;
 
             let mut next_tx_num = meta.get("next_tx_num")?.map(|g| g.value()).unwrap_or(0);
             let mut total_txs = meta.get("total_txs")?.map(|g| g.value()).unwrap_or(0);
+            let mut ai_req_seq = meta.get("ai_req_seq")?.map(|g| g.value()).unwrap_or(0);
+            let mut ai_chal_seq = meta.get("ai_chal_seq")?.map(|g| g.value()).unwrap_or(0);
             let mut checkpoint: Option<(String, u64)> = None;
 
             for group in groups {
@@ -316,6 +384,100 @@ impl Store {
                         totals_t.insert(e.address.as_str(), enc(&(recv, cnt)).as_slice())?;
                     }
 
+                    // AI inference subsystem (phase 2c): extract from the same
+                    // pass. Gated by the per-block idempotency check above, so a
+                    // replay of an applied block never double-indexes.
+                    match raw.subnetwork_id.as_str() {
+                        inference::SUBNET_AI_REQUEST => {
+                            if let Some(bytes) = inference::from_hex(&raw.payload) {
+                                if let Some(req) = inference::decode_request(&bytes) {
+                                    let rhash = inference::request_hash(&bytes);
+                                    if ai_req_hash_t.get(rhash.as_str())?.is_none() {
+                                        let miner_pubkey = raw.outputs.get(1).and_then(|o| {
+                                            inference::csv_escrow_pubkey(&o.script_public_key)
+                                        });
+                                        let rec = AiRequestRec {
+                                            tx_id: raw.tx_id.clone(),
+                                            model_id: req.model_id,
+                                            max_tokens: req.max_tokens,
+                                            inference_reward: req.inference_reward,
+                                            priority_fee: req.priority_fee,
+                                            prompt: req.prompt,
+                                            daa_score: group.daa_score,
+                                            block_hash: group.chain_block_hash.clone(),
+                                            request_hash: rhash.clone(),
+                                            miner_pubkey,
+                                        };
+                                        ai_req_t.insert(ai_req_seq, enc(&rec).as_slice())?;
+                                        ai_req_hash_t.insert(rhash.as_str(), ai_req_seq)?;
+                                        ai_req_seq += 1;
+                                    }
+                                }
+                            }
+                        }
+                        inference::SUBNET_AI_RESPONSE => {
+                            if let Some(bytes) = inference::from_hex(&raw.payload) {
+                                if let Some(resp) = inference::decode_response(&bytes) {
+                                    let resp_hash = inference::request_hash(&bytes);
+                                    let rec = AiResponseRec {
+                                        cid: resp.cid,
+                                        result_block_hash: group.chain_block_hash.clone(),
+                                        response_length: resp.response_length,
+                                        daa_score: group.daa_score,
+                                    };
+                                    ai_resp_t
+                                        .insert(resp.request_hash.as_str(), enc(&rec).as_slice())?;
+                                    ai_resp_hash_t
+                                        .insert(resp_hash.as_str(), resp.request_hash.as_str())?;
+                                }
+                            }
+                        }
+                        inference::SUBNET_AI_CHALLENGE => {
+                            if let Some(bytes) = inference::from_hex(&raw.payload) {
+                                if let Some(chal) = inference::decode_challenge(&bytes) {
+                                    let request_hash = chal
+                                        .request_hash
+                                        .or_else(|| {
+                                            ai_resp_hash_t
+                                                .get(chal.response_hash.as_str())
+                                                .ok()
+                                                .flatten()
+                                                .map(|g| g.value().to_string())
+                                        })
+                                        .unwrap_or_default();
+                                    let rec = AiChallengeRec {
+                                        tx_id: raw.tx_id.clone(),
+                                        request_hash,
+                                        daa_score: group.daa_score,
+                                    };
+                                    ai_chal_t.insert(ai_chal_seq, enc(&rec).as_slice())?;
+                                    ai_chal_seq += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    if raw.is_coinbase {
+                        if let Some(bytes) = inference::from_hex(&raw.payload) {
+                            let models = inference::parse_ai_caps(&bytes);
+                            if !models.is_empty() {
+                                let pubkey = inference::parse_escrow_pubkey(&bytes).or_else(|| {
+                                    raw.outputs
+                                        .first()
+                                        .and_then(|o| inference::p2pk_pubkey(&o.script_public_key))
+                                });
+                                if let Some(pk) = pubkey {
+                                    for model_id in models {
+                                        ai_caps_t.insert(
+                                            caps_key(&model_id, &pk).as_slice(),
+                                            group.daa_score,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     tx_nums.push(tx_num);
                     total_txs += 1;
                     stats.applied_txs += 1;
@@ -333,6 +495,8 @@ impl Store {
 
             meta.insert("next_tx_num", next_tx_num)?;
             meta.insert("total_txs", total_txs)?;
+            meta.insert("ai_req_seq", ai_req_seq)?;
+            meta.insert("ai_chal_seq", ai_chal_seq)?;
             if let Some((hash, daa)) = checkpoint {
                 meta_str.insert("checkpoint_hash", hash.as_str())?;
                 meta.insert("checkpoint_daa", daa)?;
@@ -488,6 +652,68 @@ impl Store {
                 applied_t.remove(hash.as_str())?;
                 acc_t.remove(hash.as_str())?;
             }
+
+            // Inference tables (low volume) — drop entries below the cutoff.
+            let mut ai_req_t = write.open_table(AI_REQ)?;
+            let mut ai_req_hash_t = write.open_table(AI_REQ_BY_HASH)?;
+            let mut ai_resp_t = write.open_table(AI_RESP)?;
+            let mut ai_resp_hash_t = write.open_table(AI_RESP_HASH)?;
+            let mut ai_chal_t = write.open_table(AI_CHAL)?;
+            let mut ai_caps_t = write.open_table(AI_CAPS)?;
+
+            let mut exp_req: Vec<(u64, String)> = Vec::new();
+            {
+                for item in ai_req_t.iter()? {
+                    let (k, v) = item?;
+                    let rec: AiRequestRec = dec(v.value())?;
+                    if rec.daa_score < cutoff_daa {
+                        exp_req.push((k.value(), rec.request_hash));
+                    }
+                }
+            }
+            for (seq, rhash) in &exp_req {
+                ai_req_t.remove(seq)?;
+                ai_req_hash_t.remove(rhash.as_str())?;
+                ai_resp_t.remove(rhash.as_str())?;
+            }
+            // Response-hash mappings whose request is gone.
+            let mut exp_rh: Vec<String> = Vec::new();
+            {
+                for item in ai_resp_hash_t.iter()? {
+                    let (k, v) = item?;
+                    if ai_req_hash_t.get(v.value())?.is_none() {
+                        exp_rh.push(k.value().to_string());
+                    }
+                }
+            }
+            for rh in &exp_rh {
+                ai_resp_hash_t.remove(rh.as_str())?;
+            }
+            let mut exp_chal: Vec<u64> = Vec::new();
+            {
+                for item in ai_chal_t.iter()? {
+                    let (k, v) = item?;
+                    let rec: AiChallengeRec = dec(v.value())?;
+                    if rec.daa_score < cutoff_daa {
+                        exp_chal.push(k.value());
+                    }
+                }
+            }
+            for seq in &exp_chal {
+                ai_chal_t.remove(seq)?;
+            }
+            let mut exp_caps: Vec<Vec<u8>> = Vec::new();
+            {
+                for item in ai_caps_t.iter()? {
+                    let (k, v) = item?;
+                    if v.value() < cutoff_daa {
+                        exp_caps.push(k.value().to_vec());
+                    }
+                }
+            }
+            for key in &exp_caps {
+                ai_caps_t.remove(key.as_slice())?;
+            }
         }
         write.commit()?;
         Ok(removed)
@@ -608,6 +834,88 @@ impl Store {
             Some(g) => Ok(Some(dec(g.value())?)),
             None => Ok(None),
         }
+    }
+
+    // --- AI inference reads (phase 2c) ---
+
+    /// Newest-first inference requests, each joined with its response (if the
+    /// miner has published one yet).
+    pub fn inference_feed(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(AiRequestRec, Option<AiResponseRec>)>, StoreError> {
+        let read = self.db.begin_read()?;
+        let req_t = read.open_table(AI_REQ)?;
+        let resp_t = read.open_table(AI_RESP)?;
+        let mut out = Vec::new();
+        let mut skipped = 0usize;
+        for item in req_t.iter()?.rev() {
+            let (_k, v) = item?;
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if out.len() >= limit {
+                break;
+            }
+            let req: AiRequestRec = dec(v.value())?;
+            let resp = match resp_t.get(req.request_hash.as_str())? {
+                Some(g) => Some(dec::<AiResponseRec>(g.value())?),
+                None => None,
+            };
+            out.push((req, resp));
+        }
+        Ok(out)
+    }
+
+    /// Newest-first fraud challenges.
+    pub fn challenges(&self, limit: usize) -> Result<Vec<AiChallengeRec>, StoreError> {
+        let read = self.db.begin_read()?;
+        let chal_t = read.open_table(AI_CHAL)?;
+        let mut out = Vec::new();
+        for item in chal_t.iter()?.rev() {
+            if out.len() >= limit {
+                break;
+            }
+            let (_k, v) = item?;
+            out.push(dec::<AiChallengeRec>(v.value())?);
+        }
+        Ok(out)
+    }
+
+    /// Declared model capabilities, aggregated from coinbase markers.
+    pub fn capabilities(&self) -> Result<Vec<Capability>, StoreError> {
+        let read = self.db.begin_read()?;
+        let caps_t = read.open_table(AI_CAPS)?;
+        let mut by_model: HashMap<String, (Vec<String>, u64)> = HashMap::new();
+        for item in caps_t.iter()? {
+            let (k, v) = item?;
+            let key = k.value();
+            let Some(sep) = key.iter().position(|&b| b == 0xFF) else {
+                continue;
+            };
+            let model_id = String::from_utf8_lossy(&key[..sep]).into_owned();
+            let pubkey = String::from_utf8_lossy(&key[sep + 1..]).into_owned();
+            let last_seen = v.value();
+            let entry = by_model.entry(model_id).or_insert_with(|| (Vec::new(), 0));
+            entry.0.push(pubkey);
+            entry.1 = entry.1.max(last_seen);
+        }
+        let mut out: Vec<Capability> = by_model
+            .into_iter()
+            .map(|(model_id, (mut pubkeys, last_seen_daa))| {
+                pubkeys.sort();
+                pubkeys.dedup();
+                Capability {
+                    model_id,
+                    miner_pubkeys: pubkeys,
+                    last_seen_daa,
+                }
+            })
+            .collect();
+        out.sort_by_key(|c| std::cmp::Reverse(c.last_seen_daa));
+        Ok(out)
     }
 }
 
@@ -936,6 +1244,170 @@ mod tests {
         assert!(s.tx_by_id("cb3").unwrap().is_some());
         let hist = s.address_history(&addr(PK1), 10, 0).unwrap();
         assert_eq!(hist.len(), 2); // blk3, blk4
+    }
+
+    #[test]
+    fn indexes_inference_request_response_challenge_and_caps() {
+        let s = temp_store();
+        let model_id = "ad50ad0bd461d8ab44efc0214989eb33291685ef4ade22a0f4f217d03266d837";
+        let miner_pk = "cc".repeat(32);
+
+        // AiRequest payload + CSV-escrow output naming the miner.
+        let mut req_payload = inference::from_hex(model_id).unwrap();
+        req_payload.extend_from_slice(&128u32.to_le_bytes());
+        req_payload.extend_from_slice(&60_000_000u64.to_le_bytes());
+        req_payload.extend_from_slice(&30_000_000u64.to_le_bytes());
+        req_payload.extend_from_slice(b"why is the sky blue?");
+        let req_hash = inference::request_hash(&req_payload);
+        let ai_request = RawTx {
+            tx_id: "req1".into(),
+            is_coinbase: false,
+            version: 0,
+            lock_time: 0,
+            subnetwork_id: inference::SUBNET_AI_REQUEST.into(),
+            gas: 0,
+            payload: inference::to_hex(&req_payload),
+            inputs: vec![],
+            outputs: vec![
+                RawOut {
+                    amount: 0,
+                    script_version: 0,
+                    script_public_key: p2pk(PK1),
+                },
+                RawOut {
+                    amount: 60_000_000,
+                    script_version: 0,
+                    script_public_key: format!("02a08cb120{miner_pk}ac"),
+                },
+            ],
+        };
+
+        // AiResponse referencing the request by request_hash, carrying a CID.
+        let mut resp_payload = vec![0u8; 78];
+        resp_payload[0..32].copy_from_slice(&inference::from_hex(&req_hash).unwrap());
+        resp_payload[32..40].copy_from_slice(&9_000u64.to_le_bytes());
+        resp_payload[40] = 0x12;
+        resp_payload[41] = 0x20;
+        for (i, b) in resp_payload.iter_mut().enumerate().take(74).skip(42) {
+            *b = i as u8;
+        }
+        resp_payload[74..78].copy_from_slice(&256u32.to_le_bytes());
+        let resp_hash = inference::request_hash(&resp_payload);
+        let ai_response = RawTx {
+            tx_id: "resp1".into(),
+            is_coinbase: false,
+            version: 0,
+            lock_time: 0,
+            subnetwork_id: inference::SUBNET_AI_RESPONSE.into(),
+            gas: 0,
+            payload: inference::to_hex(&resp_payload),
+            inputs: vec![],
+            outputs: vec![RawOut {
+                amount: 0,
+                script_version: 0,
+                script_public_key: p2pk(PK1),
+            }],
+        };
+
+        // AiChallenge referencing the response, proof_data = request_hash.
+        let mut chal_payload = vec![0u8; 74 + 32];
+        chal_payload[0..32].copy_from_slice(&inference::from_hex(&resp_hash).unwrap());
+        chal_payload[74..106].copy_from_slice(&inference::from_hex(&req_hash).unwrap());
+        let ai_challenge = RawTx {
+            tx_id: "chal1".into(),
+            is_coinbase: false,
+            version: 0,
+            lock_time: 0,
+            subnetwork_id: inference::SUBNET_AI_CHALLENGE.into(),
+            gas: 0,
+            payload: inference::to_hex(&chal_payload),
+            inputs: vec![],
+            outputs: vec![RawOut {
+                amount: 0,
+                script_version: 0,
+                script_public_key: p2pk(PK1),
+            }],
+        };
+
+        // Coinbase declaring the model capability + escrow pubkey.
+        let cb_payload = format!("v1.3/ai:cap:{model_id}/escrow:{miner_pk}/");
+        let coinbase = RawTx {
+            tx_id: "cbAI".into(),
+            is_coinbase: true,
+            version: 0,
+            lock_time: 0,
+            subnetwork_id: "01".repeat(20),
+            gas: 0,
+            payload: inference::to_hex(cb_payload.as_bytes()),
+            inputs: vec![],
+            outputs: vec![RawOut {
+                amount: 5_000,
+                script_version: 0,
+                script_public_key: p2pk(PK1),
+            }],
+        };
+
+        s.apply(&[group("blk1", 100, vec![coinbase])]).unwrap();
+        s.apply(&[group("blk2", 101, vec![ai_request])]).unwrap();
+        s.apply(&[group("blk3", 102, vec![ai_response])]).unwrap();
+        s.apply(&[group("blk4", 103, vec![ai_challenge])]).unwrap();
+
+        // Capabilities from the coinbase marker.
+        let caps = s.capabilities().unwrap();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].model_id, model_id);
+        assert_eq!(caps[0].miner_pubkeys, vec![miner_pk.clone()]);
+        assert_eq!(caps[0].last_seen_daa, 100);
+
+        // Inference feed: request joined with its response CID.
+        let feed = s.inference_feed(10, 0).unwrap();
+        assert_eq!(feed.len(), 1);
+        let (req, resp) = &feed[0];
+        assert_eq!(req.tx_id, "req1");
+        assert_eq!(req.model_id, model_id);
+        assert_eq!(req.prompt, "why is the sky blue?");
+        assert_eq!(req.max_tokens, 128);
+        assert_eq!(req.request_hash, req_hash);
+        assert_eq!(req.miner_pubkey.as_deref(), Some(miner_pk.as_str()));
+        let resp = resp.as_ref().expect("response joined");
+        assert!(resp.cid.starts_with("Qm"));
+        assert_eq!(resp.result_block_hash, "blk3");
+
+        // Challenge references the request_hash; fraud not provable on-chain.
+        let challenges = s.challenges(10).unwrap();
+        assert_eq!(challenges.len(), 1);
+        assert_eq!(challenges[0].tx_id, "chal1");
+        assert_eq!(challenges[0].request_hash, req_hash);
+    }
+
+    #[test]
+    fn inference_rows_expire_with_the_window() {
+        let s = temp_store();
+        let model_id = "ad50ad0bd461d8ab44efc0214989eb33291685ef4ade22a0f4f217d03266d837";
+        let mut req_payload = inference::from_hex(model_id).unwrap();
+        req_payload.extend_from_slice(&64u32.to_le_bytes());
+        req_payload.extend_from_slice(&50_000_000u64.to_le_bytes());
+        req_payload.extend_from_slice(&30_000_000u64.to_le_bytes());
+        req_payload.extend_from_slice(b"hi");
+        let ai_request = RawTx {
+            tx_id: "reqOld".into(),
+            is_coinbase: false,
+            version: 0,
+            lock_time: 0,
+            subnetwork_id: inference::SUBNET_AI_REQUEST.into(),
+            gas: 0,
+            payload: inference::to_hex(&req_payload),
+            inputs: vec![],
+            outputs: vec![RawOut {
+                amount: 0,
+                script_version: 0,
+                script_public_key: p2pk(PK1),
+            }],
+        };
+        s.apply(&[group("blkO", 100, vec![ai_request])]).unwrap();
+        assert_eq!(s.inference_feed(10, 0).unwrap().len(), 1);
+        s.expire_below(200).unwrap();
+        assert_eq!(s.inference_feed(10, 0).unwrap().len(), 0);
     }
 
     #[test]
