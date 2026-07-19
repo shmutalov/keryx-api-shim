@@ -17,29 +17,31 @@ const RESPONSE_LEN: usize = 78;
 const MIN_CHALLENGE_LEN: usize = 74;
 
 // --- model registry (model_id hex → wallet key) -------------------------------
-// keryx-node keeps no on-chain name registry; these mirror the wallet's
-// hardcoded list (src/lib/models.js), which is what the UI displays.
+// The H4 lineup. keryx-node keeps no on-chain *name* registry, only the model_id
+// consensus constants (params.rs); these ids mirror those and the miner's
+// models.rs, and the keys mirror the wallet's src/lib/models.js. Keep all three
+// in lockstep. An id not listed here resolves to its raw hex (model_name()).
 
 const MODELS: &[(&str, &str)] = &[
     (
-        "4f21ddeb7d62bd2265bc54230d536ca3f1749927780f528c3c41fa2911df4d72",
-        "qwen3-1.7b",
+        "300a99b3a85b0ab45d1d930bb7b1d4b0f35983d521e79ff21193a6908dc4b810",
+        "exaone-4.0-1.2b",
     ),
     (
-        "ad50ad0bd461d8ab44efc0214989eb33291685ef4ade22a0f4f217d03266d837",
-        "gemma-3-4b",
+        "8c2fea600f0eefe7048741a5119cb7be303037f59fc026e48382658f23581e0a",
+        "mistral-7b-v0.3",
     ),
     (
-        "9421066a6400c98ba137114f7f4b7d4a2ddf13ab163a5de38c0184793af6313a",
-        "dolphin-llama3-8b",
+        "fa2f13be0850e26c5ce86c7ac79da85e300c1da8b3290f9a18d47105f1f2140a",
+        "glm-4-9b-0414",
     ),
     (
-        "65c6eb6fe18b9efd8060ab9d2d03bb9b01050a3b1378cbac000c5cc0acdc0d2a",
-        "qwen3-32b-abliterated",
+        "b8bdc01fa407eab943e4fefc807483b39f8142785256049e1f559698a5284746",
+        "qwen3.6-27b",
     ),
     (
-        "6df46a78cbe4dc579f04dbd801f1a520b9eae28ce7b50c8da7874bfa3fb5108d",
-        "llama-3.3-70b-q2",
+        "3dc09358ad75c6ef0c9c86ee4f47c4d6acda961fecbd0e4f9cf55e8f0fdffddb",
+        "kimi-linear-48b",
     ),
 ];
 
@@ -294,8 +296,8 @@ mod tests {
 
     #[test]
     fn parses_coinbase_caps_and_escrow() {
-        let m1 = "ad50ad0bd461d8ab44efc0214989eb33291685ef4ade22a0f4f217d03266d837";
-        let m2 = "9421066a6400c98ba137114f7f4b7d4a2ddf13ab163a5de38c0184793af6313a";
+        let m1 = "300a99b3a85b0ab45d1d930bb7b1d4b0f35983d521e79ff21193a6908dc4b810";
+        let m2 = "fa2f13be0850e26c5ce86c7ac79da85e300c1da8b3290f9a18d47105f1f2140a";
         let pk = "cc".repeat(32);
         let payload = format!("1.3.1/ai:cap:{m1},{m2}/escrow:{pk}/blah");
         let caps = parse_ai_caps(payload.as_bytes());
@@ -323,8 +325,8 @@ mod tests {
     #[test]
     fn model_registry_resolves_wallet_keys() {
         assert_eq!(
-            model_key("ad50ad0bd461d8ab44efc0214989eb33291685ef4ade22a0f4f217d03266d837"),
-            Some("gemma-3-4b")
+            model_key("fa2f13be0850e26c5ce86c7ac79da85e300c1da8b3290f9a18d47105f1f2140a"),
+            Some("glm-4-9b-0414")
         );
         assert_eq!(model_key("00".repeat(32).as_str()), None);
     }

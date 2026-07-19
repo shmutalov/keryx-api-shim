@@ -1249,7 +1249,7 @@ mod tests {
     #[test]
     fn indexes_inference_request_response_challenge_and_caps() {
         let s = temp_store();
-        let model_id = "ad50ad0bd461d8ab44efc0214989eb33291685ef4ade22a0f4f217d03266d837";
+        let model_id = "fa2f13be0850e26c5ce86c7ac79da85e300c1da8b3290f9a18d47105f1f2140a";
         let miner_pk = "cc".repeat(32);
 
         // AiRequest payload + CSV-escrow output naming the miner.
@@ -1383,7 +1383,7 @@ mod tests {
     #[test]
     fn inference_rows_expire_with_the_window() {
         let s = temp_store();
-        let model_id = "ad50ad0bd461d8ab44efc0214989eb33291685ef4ade22a0f4f217d03266d837";
+        let model_id = "fa2f13be0850e26c5ce86c7ac79da85e300c1da8b3290f9a18d47105f1f2140a";
         let mut req_payload = inference::from_hex(model_id).unwrap();
         req_payload.extend_from_slice(&64u32.to_le_bytes());
         req_payload.extend_from_slice(&50_000_000u64.to_le_bytes());
