@@ -261,10 +261,14 @@ On-chain mechanics (from keryx-node `inference/src/ai_payload.rs`):
 - **`fraud_proven` is always `false`**: keryx-node removed on-chain slashing in
   v1.2.3, so no fraud is provable from consensus state. Documented in the
   endpoint and the response.
-- PoM (`RpcBlock.pomProof`) is dormant (`pom_activation = never()`), so caps use
-  the coinbase markers, not PoM — forward-compatible if PoM activates.
+- PoM (`RpcBlock.pomProof`) is live on mainnet (`pom_activation = 37_780_000`)
+  but `never()` on the simnet the shim is tested against, so caps come from the
+  coinbase markers, not PoM — forward-compatible either way.
 - No on-chain model-name registry; the shim mirrors the wallet's hardcoded
-  model_id→name table (`src/lib/models.js`).
+  model_id→name table (`src/lib/models.js`). Currently the **H5** lineup —
+  keryx-node's `POM_TIERS_H5` swaps tier 0 only (EXAONE-4.0-1.2B →
+  Qwen3-8B-abliterated, id `d42fa6ee…`); tiers 1-4 carry over from H4. The
+  retired EXAONE id stays in the table so pre-fork rows still render by name.
 
 Endpoints served from the indexer (else `[]`): `/capabilities`, `/infer`
 (joined feed, `payload_prefix`, `result` CID, `result_text: null`),

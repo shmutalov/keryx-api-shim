@@ -17,13 +17,23 @@ const RESPONSE_LEN: usize = 78;
 const MIN_CHALLENGE_LEN: usize = 74;
 
 // --- model registry (model_id hex → wallet key) -------------------------------
-// The H4 lineup. keryx-node keeps no on-chain *name* registry, only the model_id
+// The H5 lineup. keryx-node keeps no on-chain *name* registry, only the model_id
 // consensus constants (params.rs); these ids mirror those and the miner's
 // models.rs, and the keys mirror the wallet's src/lib/models.js. Keep all three
 // in lockstep. An id not listed here resolves to its raw hex (model_name()).
+//
+// H5 (`POM_TIERS_H5`) swaps ONLY tier 0: EXAONE-4.0-1.2B → Qwen3-8B-abliterated;
+// tiers 1-4 are unchanged from H4. The registry is name resolution only, not a
+// consensus table, so the retired EXAONE id stays listed — the indexer window can
+// still straddle the H5 gate and carry pre-fork AiRequests that must render by name.
 
 const MODELS: &[(&str, &str)] = &[
     (
+        "d42fa6ee00e07d49b046090a56af0e7bd61025937c502e2c574a72874c350d24",
+        "qwen3-8b-abliterated",
+    ),
+    (
+        // retired at H5 (pre-fork tier 0) — kept for historical AiRequest decode
         "300a99b3a85b0ab45d1d930bb7b1d4b0f35983d521e79ff21193a6908dc4b810",
         "exaone-4.0-1.2b",
     ),
@@ -296,7 +306,7 @@ mod tests {
 
     #[test]
     fn parses_coinbase_caps_and_escrow() {
-        let m1 = "300a99b3a85b0ab45d1d930bb7b1d4b0f35983d521e79ff21193a6908dc4b810";
+        let m1 = "d42fa6ee00e07d49b046090a56af0e7bd61025937c502e2c574a72874c350d24";
         let m2 = "fa2f13be0850e26c5ce86c7ac79da85e300c1da8b3290f9a18d47105f1f2140a";
         let pk = "cc".repeat(32);
         let payload = format!("1.3.1/ai:cap:{m1},{m2}/escrow:{pk}/blah");
@@ -327,6 +337,15 @@ mod tests {
         assert_eq!(
             model_key("fa2f13be0850e26c5ce86c7ac79da85e300c1da8b3290f9a18d47105f1f2140a"),
             Some("glm-4-9b-0414")
+        );
+        // H5 tier 0 (POM_TIERS_H5[0]) and the retired H4 tier 0 both resolve.
+        assert_eq!(
+            model_key("D42FA6EE00E07D49B046090A56AF0E7BD61025937C502E2C574A72874C350D24"),
+            Some("qwen3-8b-abliterated")
+        );
+        assert_eq!(
+            model_key("300a99b3a85b0ab45d1d930bb7b1d4b0f35983d521e79ff21193a6908dc4b810"),
+            Some("exaone-4.0-1.2b")
         );
         assert_eq!(model_key("00".repeat(32).as_str()), None);
     }
