@@ -265,10 +265,16 @@ On-chain mechanics (from keryx-node `inference/src/ai_payload.rs`):
   but `never()` on the simnet the shim is tested against, so caps come from the
   coinbase markers, not PoM — forward-compatible either way.
 - No on-chain model-name registry; the shim mirrors the wallet's hardcoded
-  model_id→name table (`src/lib/models.js`). Currently the **H5** lineup —
-  keryx-node's `POM_TIERS_H5` swaps tier 0 only (EXAONE-4.0-1.2B →
-  Qwen3-8B-abliterated, id `d42fa6ee…`); tiers 1-4 carry over from H4. The
-  retired EXAONE id stays in the table so pre-fork rows still render by name.
+  model_id→name table (`src/lib/models.js`). Currently the **H6** lineup —
+  keryx-node's `POM_TIERS_H6` (gated by `pom_v3_activation`): tier 0 =
+  Qwen3.5-9B-abliterated (id `bd34568c…`, replaces both Qwen3-8B and
+  Mistral-7B), tier 1 = GLM-4-9B, tier 2 = gemma-4-12B-abliterated (new, id
+  `39998404…`), tiers 3-4 unchanged. Retired ids (Qwen3-8B, EXAONE,
+  Mistral-7B) stay in the table so pre-fork rows still render by name.
+- H6 also introduced **V2 AiResponses** (`ai_payload.rs`): 78 v1 bytes +
+  `[escrow_pubkey: 32][schnorr_sig: 64]` = 174 bytes. `decode_response`
+  accepts both lengths (v1 fields sit at the same offsets); the responder
+  identity is consensus-only and not surfaced in the feed.
 
 Endpoints served from the indexer (else `[]`): `/capabilities`, `/infer`
 (joined feed, `payload_prefix`, `result` CID, `result_text: null`),

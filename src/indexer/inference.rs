@@ -17,18 +17,25 @@ const RESPONSE_LEN: usize = 78;
 const MIN_CHALLENGE_LEN: usize = 74;
 
 // --- model registry (model_id hex → wallet key) -------------------------------
-// The H5 lineup. keryx-node keeps no on-chain *name* registry, only the model_id
+// The H6 lineup. keryx-node keeps no on-chain *name* registry, only the model_id
 // consensus constants (params.rs); these ids mirror those and the miner's
 // models.rs, and the keys mirror the wallet's src/lib/models.js. Keep all three
 // in lockstep. An id not listed here resolves to its raw hex (model_name()).
 //
-// H5 (`POM_TIERS_H5`) swaps ONLY tier 0: EXAONE-4.0-1.2B → Qwen3-8B-abliterated;
-// tiers 1-4 are unchanged from H4. The registry is name resolution only, not a
-// consensus table, so the retired EXAONE id stays listed — the indexer window can
-// still straddle the H5 gate and carry pre-fork AiRequests that must render by name.
+// H6 (`POM_TIERS_H6`, gated by `pom_v3_activation`) keeps 5 tiers: tier 0 =
+// Qwen3.5-9B-abliterated (replaces BOTH Qwen3-8B and Mistral-7B), tier 1 =
+// GLM-4-9B (slides from position 2), tier 2 = gemma-4-12B-abliterated (NEW,
+// 16 GB cards), tiers 3-4 unchanged. The registry is name resolution only, not
+// a consensus table, so retired ids stay listed — the indexer window can still
+// straddle a fork gate and carry pre-fork AiRequests that must render by name.
 
 const MODELS: &[(&str, &str)] = &[
     (
+        "bd34568cd89f5f19c6c3a6e1a61b929bc868709409eaad8e672d85f3c1eb5710",
+        "qwen3.5-9b-abliterated",
+    ),
+    (
+        // retired at H6 (H5 tier 0) — kept for historical AiRequest decode
         "d42fa6ee00e07d49b046090a56af0e7bd61025937c502e2c574a72874c350d24",
         "qwen3-8b-abliterated",
     ),
@@ -38,12 +45,17 @@ const MODELS: &[(&str, &str)] = &[
         "exaone-4.0-1.2b",
     ),
     (
+        // retired at H6 (H4/H5 tier 1) — kept for historical AiRequest decode
         "8c2fea600f0eefe7048741a5119cb7be303037f59fc026e48382658f23581e0a",
         "mistral-7b-v0.3",
     ),
     (
         "fa2f13be0850e26c5ce86c7ac79da85e300c1da8b3290f9a18d47105f1f2140a",
         "glm-4-9b-0414",
+    ),
+    (
+        "399984045600f7d58d1b2cf01e6a4bf466fa15c7ac31bd0dd1a71e003b617cc6",
+        "gemma-4-12b-abliterated",
     ),
     (
         "b8bdc01fa407eab943e4fefc807483b39f8142785256049e1f559698a5284746",
@@ -130,6 +142,10 @@ pub struct AiResponse {
 }
 
 pub fn decode_response(payload: &[u8]) -> Option<AiResponse> {
+    // H6 V2 responses append [escrow_pubkey: 32][schnorr_sig: 64] after the 78
+    // v1 bytes (ai_payload.rs `AI_RESPONSE_PAYLOAD_V2_LEN` = 174). The v1 fields
+    // sit at the same offsets, so `>=` decodes both eras; the responder identity
+    // is consensus-only and not surfaced in the feed.
     if payload.len() < RESPONSE_LEN {
         return None;
     }
@@ -289,6 +305,14 @@ mod tests {
         assert_eq!(r.response_length, 256);
         assert!(r.cid.starts_with("Qm"), "CIDv0 starts with Qm: {}", r.cid);
         assert_eq!(r.cid.len(), 46);
+
+        // H6 V2 payload (78 + 32 pubkey + 64 sig = 174 bytes): the v1 fields
+        // decode identically from the same offsets.
+        let mut v2 = p.clone();
+        v2.extend_from_slice(&[0x44u8; 32]);
+        v2.extend_from_slice(&[0x55u8; 64]);
+        assert_eq!(v2.len(), 174);
+        assert_eq!(decode_response(&v2).unwrap(), r);
     }
 
     #[test]
@@ -338,7 +362,17 @@ mod tests {
             model_key("fa2f13be0850e26c5ce86c7ac79da85e300c1da8b3290f9a18d47105f1f2140a"),
             Some("glm-4-9b-0414")
         );
-        // H5 tier 0 (POM_TIERS_H5[0]) and the retired H4 tier 0 both resolve.
+        // H6 tiers 0 and 2 (POM_TIERS_H6[0]/[2]) resolve.
+        assert_eq!(
+            model_key("bd34568cd89f5f19c6c3a6e1a61b929bc868709409eaad8e672d85f3c1eb5710"),
+            Some("qwen3.5-9b-abliterated")
+        );
+        assert_eq!(
+            model_key("399984045600f7d58d1b2cf01e6a4bf466fa15c7ac31bd0dd1a71e003b617cc6"),
+            Some("gemma-4-12b-abliterated")
+        );
+        // Retired pre-fork tier-0s (H5's Qwen3-8B, H4's EXAONE) still resolve
+        // for historical decode, case-insensitively.
         assert_eq!(
             model_key("D42FA6EE00E07D49B046090A56AF0E7BD61025937C502E2C574A72874C350D24"),
             Some("qwen3-8b-abliterated")
