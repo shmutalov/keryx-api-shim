@@ -7,6 +7,11 @@
 //! BLAKE2b-512(payload)[0..32]` (note: 512 truncated, over the raw payload —
 //! not BLAKE2b-256, not the tx id). The inference result text is off-chain
 //! (only the IPFS CID is on-chain); clients fetch it via the shim's /ipfs proxy.
+//!
+//! Since the node's H8 gate (`reward_routing_activation`) an AiRequest no longer
+//! names its miner: `outputs[1]` is the keyless reward vault (see
+//! `INFERENCE_VAULT_SCRIPT_HEX`) and the reward is minted by a later coinbase to
+//! the first accepted responder. Pre-H8 rows carry a CSV escrow naming the miner.
 
 pub const SUBNET_AI_REQUEST: &str = "0300000000000000000000000000000000000000";
 pub const SUBNET_AI_RESPONSE: &str = "0400000000000000000000000000000000000000";
@@ -15,6 +20,21 @@ pub const SUBNET_AI_CHALLENGE: &str = "0500000000000000000000000000000000000000"
 const MIN_REQUEST_LEN: usize = 52;
 const RESPONSE_LEN: usize = 78;
 const MIN_CHALLENGE_LEN: usize = 74;
+
+/// Canonical keyless reward vault of a routed AiRequest (`OP_RETURN "aivault"`),
+/// hex. At/after the node's H8 gate (`reward_routing_activation`, mainnet DAA
+/// 79 210 000) consensus requires `AiRequest.outputs[1]` to carry EXACTLY this
+/// version-0 script: the reward names nobody up front and is minted by a later
+/// coinbase to the first accepted responder, or burns. Before H8 the same output
+/// was a CSV-escrow script naming the target miner (see `csv_escrow_pubkey`).
+/// Mirrors `keryx_inference::INFERENCE_VAULT_SCRIPT`.
+pub const INFERENCE_VAULT_SCRIPT_HEX: &str = "6a0761697661756c74";
+
+/// Whether a script is the H8 inference reward vault. Exact match only: a
+/// look-alike `OP_RETURN` is not a vault (the node rejects it as non-standard).
+pub fn is_inference_vault(script_hex: &str) -> bool {
+    script_hex.eq_ignore_ascii_case(INFERENCE_VAULT_SCRIPT_HEX)
+}
 
 // --- model registry (model_id hex → wallet key) -------------------------------
 // The H6 lineup. keryx-node keeps no on-chain *name* registry, only the model_id
@@ -226,7 +246,7 @@ pub fn p2pk_pubkey(script_hex: &str) -> Option<String> {
 
 /// x-only miner pubkey from an OPoI CSV-escrow script
 /// (`<seq_len><seq> OP_CSV(0xb1) OP_DATA_32(0x20) <32> OP_CHECKSIG(0xac)`),
-/// i.e. `AiRequest.outputs[1]`.
+/// i.e. a pre-H8 `AiRequest.outputs[1]`. A routed request's vault yields `None`.
 pub fn csv_escrow_pubkey(script_hex: &str) -> Option<String> {
     let b = from_hex(script_hex)?;
     if b.len() < 37 {
@@ -354,6 +374,21 @@ mod tests {
         let csv = format!("02a08cb120{pk}ac");
         assert_eq!(csv_escrow_pubkey(&csv).as_deref(), Some(pk.as_str()));
         assert_eq!(p2pk_pubkey(&csv), None);
+    }
+
+    #[test]
+    fn recognises_the_h8_reward_vault() {
+        // OP_RETURN(0x6a) PUSH7 "aivault" = keryx_inference::INFERENCE_VAULT_SCRIPT.
+        let vault = to_hex(&[0x6a, 0x07, b'a', b'i', b'v', b'a', b'u', b'l', b't']);
+        assert_eq!(vault, INFERENCE_VAULT_SCRIPT_HEX);
+        assert!(is_inference_vault(&vault));
+        assert!(is_inference_vault(&vault.to_ascii_uppercase()));
+        // A look-alike OP_RETURN is not the vault (the node calls it non-standard).
+        assert!(!is_inference_vault(&to_hex(b"jaivaulu")));
+        assert!(!is_inference_vault(""));
+        // The vault names no miner, so neither pubkey extractor matches it.
+        assert_eq!(csv_escrow_pubkey(&vault), None);
+        assert_eq!(p2pk_pubkey(&vault), None);
     }
 
     #[test]

@@ -275,6 +275,20 @@ On-chain mechanics (from keryx-node `inference/src/ai_payload.rs`):
   `[escrow_pubkey: 32][schnorr_sig: 64]` = 174 bytes. `decode_response`
   accepts both lengths (v1 fields sit at the same offsets); the responder
   identity is consensus-only and not surfaced in the feed.
+- **H8 reward routing** (keryx-node `reward_routing_activation`, mainnet DAA
+  79 210 000, testnet from genesis, never on simnet/devnet): `AiRequest.outputs[1]`
+  must be the keyless vault `OP_RETURN "aivault"`
+  (`keryx_inference::INFERENCE_VAULT_SCRIPT`) instead of a CSV escrow naming a
+  miner; a later coinbase mints the reward to the first accepted responder, or
+  it burns. The store recognises the vault (`is_inference_vault`) and records
+  `miner_pubkey: None` for routed requests; pre-H8 rows keep their CSV
+  attribution. Nothing else the shim reads changed between H7 and H13
+  (keryx-node v1.6.1): the tier table is still `POM_TIERS_H6`, the 03/04/05
+  payload layouts and coinbase markers are unchanged, and H9-H13 are node-only
+  consensus gates (PoM v4 re-walk seed, service-ledger and production-index
+  snapshots, exact verification). Vendored protos refreshed to v1.6.1 (new
+  header fields `serviceStateHash`/`pomTier`, `getUtxoCountByAddress`,
+  `getUtxoEntriesByOutpoints`, `getServiceStrikes`), none used yet.
 
 Endpoints served from the indexer (else `[]`): `/capabilities`, `/infer`
 (joined feed, `payload_prefix`, `result` CID, `result_text: null`),

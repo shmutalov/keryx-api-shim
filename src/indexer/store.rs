@@ -393,8 +393,21 @@ impl Store {
                                 if let Some(req) = inference::decode_request(&bytes) {
                                     let rhash = inference::request_hash(&bytes);
                                     if ai_req_hash_t.get(rhash.as_str())?.is_none() {
+                                        // Pre-H8 outputs[1] is a CSV escrow naming the
+                                        // target miner. At/after H8 (reward routing) it is
+                                        // the keyless vault: the request targets nobody and
+                                        // the responder is only known from the AiResponse,
+                                        // so the attribution is None by design.
                                         let miner_pubkey = raw.outputs.get(1).and_then(|o| {
-                                            inference::csv_escrow_pubkey(&o.script_public_key)
+                                            if o.script_version == 0
+                                                && inference::is_inference_vault(
+                                                    &o.script_public_key,
+                                                )
+                                            {
+                                                None
+                                            } else {
+                                                inference::csv_escrow_pubkey(&o.script_public_key)
+                                            }
                                         });
                                         let rec = AiRequestRec {
                                             tx_id: raw.tx_id.clone(),
@@ -1378,6 +1391,54 @@ mod tests {
         assert_eq!(challenges.len(), 1);
         assert_eq!(challenges[0].tx_id, "chal1");
         assert_eq!(challenges[0].request_hash, req_hash);
+    }
+
+    #[test]
+    fn routed_request_with_h8_vault_is_indexed_without_a_target_miner() {
+        let s = temp_store();
+        let model_id = "bd34568cd89f5f19c6c3a6e1a61b929bc868709409eaad8e672d85f3c1eb5710";
+        let mut req_payload = inference::from_hex(model_id).unwrap();
+        req_payload.extend_from_slice(&128u32.to_le_bytes());
+        req_payload.extend_from_slice(&60_000_000u64.to_le_bytes());
+        req_payload.extend_from_slice(&30_000_000u64.to_le_bytes());
+        req_payload.extend_from_slice(b"routed");
+        let req_hash = inference::request_hash(&req_payload);
+        // Post-H8 shape: outputs[1] is the keyless vault, not a CSV escrow.
+        let ai_request = RawTx {
+            tx_id: "reqRouted".into(),
+            is_coinbase: false,
+            version: 0,
+            lock_time: 0,
+            subnetwork_id: inference::SUBNET_AI_REQUEST.into(),
+            gas: 0,
+            payload: inference::to_hex(&req_payload),
+            inputs: vec![],
+            outputs: vec![
+                RawOut {
+                    amount: 0,
+                    script_version: 0,
+                    script_public_key: p2pk(PK1),
+                },
+                RawOut {
+                    amount: 60_000_000,
+                    script_version: 0,
+                    script_public_key: inference::INFERENCE_VAULT_SCRIPT_HEX.into(),
+                },
+            ],
+        };
+        s.apply(&[group("blk1", 100, vec![ai_request])]).unwrap();
+
+        let feed = s.inference_feed(10, 0).unwrap();
+        assert_eq!(feed.len(), 1);
+        let (req, resp) = &feed[0];
+        assert_eq!(req.tx_id, "reqRouted");
+        assert_eq!(req.request_hash, req_hash);
+        assert_eq!(req.inference_reward, 60_000_000);
+        // The vault names no miner; the responder is only known from the AiResponse.
+        assert_eq!(req.miner_pubkey, None);
+        assert!(resp.is_none());
+        // The vault output is unattributed in the ledger (no address history row).
+        assert_eq!(s.total_txs().unwrap(), 1);
     }
 
     #[test]

@@ -129,6 +129,9 @@ Operational notes:
   markers. Inference result *text* is off-chain — only the IPFS CID is on-chain,
   fetched via `/ipfs/{cid}`. `fraud_proven` is always `false` (keryx-node
   removed on-chain slashing in v1.2.3).
+  Synced with keryx-node v1.6.1 (H13): since H8 (reward routing) a request's
+  reward sits in the keyless `OP_RETURN "aivault"` output rather than a CSV
+  escrow naming a miner, so routed requests index with no target miner.
 
 ## Pointing the wallet extension at the shim
 
