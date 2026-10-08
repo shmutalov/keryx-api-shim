@@ -210,6 +210,15 @@ impl NodeClient {
         proto::GetMempoolEntriesRequestMessage,
         proto::GetMempoolEntriesResponseMessage
     );
+    // keryxd >= 1.6.4 only: an older node drops the whole stream on it (see
+    // handlers::ai_providers, which checks the version first).
+    rpc_method!(
+        get_service_providers,
+        GetServiceProvidersRequest,
+        GetServiceProvidersResponse,
+        proto::GetServiceProvidersRequestMessage,
+        proto::GetServiceProvidersResponseMessage
+    );
 
     // --- subscriptions (indexer only) ---
     // The node replies with an id-matched `Notify*Response`; the actual events

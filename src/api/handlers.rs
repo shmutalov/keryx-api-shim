@@ -471,7 +471,9 @@ pub struct InferQuery {
     offset: Option<usize>,
 }
 
-/// One `/infer` row: a request joined with its first accepted response.
+/// One `/infer` row: a request joined with its first accepted response. Field
+/// names follow keryx-labs.com's `/infer` (its H14 `sealed` /
+/// `sealed_recipients` are the node's "private" request and its recipients).
 fn infer_row(
     req: &crate::indexer::store::AiRequestRec,
     resp: Option<&crate::indexer::store::AiResponseRec>,
@@ -479,18 +481,15 @@ fn infer_row(
     json!({
         "tx_id": req.tx_id,
         "model": model_name(&req.model_id),
-        // "" for a private request: the prompt is sealed to the tier's miners.
+        // "" for a sealed request: the prompt is readable by the tier's miners only.
         "prompt": req.prompt,
-        "private": req.private,
-        "recipient_count": req.recipient_count,
+        "sealed": req.private,
+        "sealed_recipients": req.recipient_count,
         "max_tokens": req.max_tokens,
         "inference_reward": req.inference_reward,
         "priority_fee": req.priority_fee,
         "daa_score": req.daa_score,
         "block_hash": req.block_hash,
-        // The request's identity as its responses name it (the tx id from H8
-        // on) — also the request-side input of an H14 answer's decryption.
-        "request_hash": req.request_hash,
         // first 16 hex of request_hash — what the wallet matches
         // against a challenge's request_hash_hex[..16].
         "payload_prefix": req.request_hash.chars().take(16).collect::<String>(),
@@ -498,11 +497,15 @@ fn infer_row(
         // off-chain; the wallet fetches it via GET /ipfs/{cid}.
         "result_text": Value::Null,
         "result_block_hash": resp.map(|r| r.result_block_hash.clone()),
+        "result_daa_score": resp.map(|r| r.daa_score),
+        // --- shim additions (not on keryx-labs.com) ---
+        // The request's identity as its responses name it (the tx id from H8 on).
+        "request_hash": req.request_hash,
         "result_tx_id": resp.and_then(|r| r.tx_id.clone()),
         "responder_pubkey": resp.and_then(|r| r.responder_pubkey.clone()),
         // H14: the answer is inline in the response, sealed to the requester
-        // (read it via /infer/{tx_id}); `result` is then only its multihash,
-        // not an IPFS pin.
+        // (read it via /inference/{tx_id}); `result` is then only its
+        // multihash, not an IPFS pin.
         "result_inline": resp.is_some_and(|r| r.inline_body),
     })
 }
@@ -521,13 +524,15 @@ pub async fn infer(State(app): State<AppState>, Query(q): Query<InferQuery>) -> 
     ))
 }
 
-/// One request by tx id with every response to it, inline bodies included —
-/// how a requester fetches its sealed (H14) answer. A private request is
-/// answered by each responder it was sealed to, each under its own key, so
-/// any body that opens with the requester's root key will do; a body that is
-/// not an envelope (`body_sealed: false`) is the responder's plaintext note
-/// that it could not open the request.
-pub async fn infer_one(
+/// One request by tx id — keryx-labs.com's `/inference/{tx_id}`, and how a
+/// requester reads its sealed (H14) answer: `sealed_responses` lists every
+/// response carrying an inline body, oldest first. Each responder seals under
+/// its own key, so the requester tries them in turn; a body that does not
+/// open is the responder's plaintext note that it could not open the request.
+/// Omitted against the official shape: `ipfs_url`, `result_status` and
+/// `result_fetch_attempts`, which describe its server-side IPFS fetch (the
+/// shim leaves IPFS to the client, so `result_text` stays null).
+pub async fn inference(
     State(app): State<AppState>,
     Path(tx_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
@@ -542,27 +547,115 @@ pub async fn infer_one(
             "inference request not found within the indexer window".into(),
         ));
     };
-    let mut row = infer_row(&detail.request, detail.first_response.as_ref());
-    row["responses"] = Value::Array(
-        detail
-            .responses
-            .iter()
-            .map(|(itx, resp)| {
-                let body = resp.private_body.as_deref();
-                json!({
-                    "tx_id": itx.tx_id,
-                    "block_hash": itx.accepting_block_hash,
-                    "daa_score": itx.accepting_daa,
-                    "cid": resp.cid,
-                    "response_length": resp.response_length,
-                    "responder_pubkey": resp.responder_pubkey,
-                    "body": body.map(crate::indexer::inference::to_hex),
-                    "body_sealed": body.is_some_and(crate::indexer::inference::is_private),
-                })
-            })
-            .collect(),
-    );
-    Ok(Json(row))
+    let req = &detail.request;
+    let first = detail.first_response.as_ref();
+    let sealed_responses: Vec<Value> = detail
+        .responses
+        .iter()
+        .filter_map(|(itx, resp)| {
+            let body = resp.private_body.as_deref()?;
+            Some(json!({
+                "responder_pubkey": resp.responder_pubkey,
+                "body": crate::indexer::inference::to_hex(body),
+                "tx_id": itx.tx_id,
+                "block_hash": itx.accepting_block_hash,
+                "daa_score": itx.accepting_daa,
+            }))
+        })
+        .collect();
+    Ok(Json(json!({
+        "tx_id": req.tx_id,
+        "model": model_name(&req.model_id),
+        "prompt": req.prompt,
+        "status": if first.is_some() { "completed" } else { "pending" },
+        "sealed": req.private,
+        "sealed_recipients": req.recipient_count,
+        "sealed_responses": sealed_responses,
+        "result_cid": first.map(|r| r.cid.clone()),
+        "result_text": Value::Null,
+        "result_block_hash": first.map(|r| r.result_block_hash.clone()),
+        "result_daa_score": first.map(|r| r.daa_score),
+    })))
+}
+
+// --- /api/v1/ai/providers ---------------------------------------------------------
+
+/// First keryxd release that knows `getServiceProviders`. An older node takes
+/// the unknown request for a protocol error and drops the whole gRPC stream —
+/// every in-flight call and the indexer's subscriptions with it — so the shim
+/// checks the version before ever sending it.
+const SERVICE_PROVIDERS_MIN_NODE: (u64, u64, u64) = (1, 6, 4);
+
+/// The wider provider window next to the eligibility cohort: ~30 min of DAA,
+/// as keryx-cli `inference send` and keryx-labs.com use, so a requester can
+/// also seal to miners that were active just before the current cohort.
+const PROVIDERS_WINDOW_DAA: u64 = 18_000;
+
+/// `major.minor.patch` from a node version string ("1.6.4", "v1.6.4-PoM").
+fn node_version(v: &str) -> Option<(u64, u64, u64)> {
+    let v = v.trim().trim_start_matches('v');
+    let end = v
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(v.len());
+    let mut parts = v[..end].split('.').map(|p| p.parse::<u64>().ok());
+    let major = parts.next().flatten()?;
+    let minor = parts.next().flatten().unwrap_or(0);
+    let patch = parts.next().flatten().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+fn provider_json(p: &proto::ServiceProviderMessage) -> Value {
+    json!({
+        "tier": p.tier,
+        "model": model_name(&p.model_id),
+        "model_id": p.model_id,
+        "identity": p.identity,
+        "escrow_pubkey": p.escrow_pubkey,
+    })
+}
+
+/// The miners a private (H14) request must be sealed to: `cohort` is the
+/// eligibility cohort the node checks a request against, `window` the
+/// providers of the last `window_daa`. keryx-labs.com's `/ai/providers` shape.
+pub async fn ai_providers(State(app): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let node = app.node.clone();
+    let version = app
+        .caches
+        .node_version
+        .get_or_try_init(move || async move {
+            node.get_server_info(proto::GetServerInfoRequestMessage {})
+                .await
+                .map(|si| si.server_version)
+        })
+        .await?;
+    if node_version(&version).is_none_or(|v| v < SERVICE_PROVIDERS_MIN_NODE) {
+        let (major, minor, patch) = SERVICE_PROVIDERS_MIN_NODE;
+        return Err(ApiError::Unavailable(format!(
+            "keryx node {version} cannot list service providers (needs {major}.{minor}.{patch} or newer)"
+        )));
+    }
+    let node = app.node.clone();
+    let providers = app
+        .caches
+        .ai_providers
+        .get_or_try_init(move || async move {
+            let (cohort, window) = tokio::try_join!(
+                node.get_service_providers(proto::GetServiceProvidersRequestMessage {
+                    window_daa: None
+                }),
+                node.get_service_providers(proto::GetServiceProvidersRequestMessage {
+                    window_daa: Some(PROVIDERS_WINDOW_DAA)
+                }),
+            )?;
+            Ok::<_, ApiError>(json!({
+                "virtual_daa_score": cohort.virtual_daa_score,
+                "window_daa": PROVIDERS_WINDOW_DAA,
+                "cohort": cohort.providers.iter().map(provider_json).collect::<Vec<_>>(),
+                "window": window.providers.iter().map(provider_json).collect::<Vec<_>>(),
+            }))
+        })
+        .await?;
+    Ok(Json(providers))
 }
 
 #[derive(Deserialize)]
@@ -677,7 +770,22 @@ pub async fn health(State(app): State<AppState>) -> Result<Json<Value>, ApiError
 
 #[cfg(test)]
 mod tests {
-    use super::is_cid_v0;
+    use super::{is_cid_v0, node_version, SERVICE_PROVIDERS_MIN_NODE};
+
+    #[test]
+    fn node_version_gates_service_providers() {
+        assert_eq!(node_version("1.6.4"), Some((1, 6, 4)));
+        assert_eq!(node_version("v1.6.3-PoM"), Some((1, 6, 3)));
+        assert_eq!(node_version("1.10.0-mock"), Some((1, 10, 0)));
+        assert_eq!(node_version("2"), Some((2, 0, 0)));
+        assert_eq!(node_version("mock"), None);
+        let allowed = |v: &str| node_version(v).is_some_and(|v| v >= SERVICE_PROVIDERS_MIN_NODE);
+        assert!(allowed("1.6.4"));
+        assert!(allowed("1.7.0"));
+        assert!(!allowed("1.6.3"));
+        assert!(!allowed("1.3.1-mock"));
+        assert!(!allowed("unknown"));
+    }
 
     #[test]
     fn cid_v0_validation() {

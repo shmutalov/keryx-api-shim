@@ -11,6 +11,8 @@ use crate::node::NodeError;
 pub enum ApiError {
     BadRequest(String),
     NotFound(String),
+    /// The node is reachable but cannot serve this (e.g. too old for the RPC).
+    Unavailable(String),
     Upstream(String),
     Internal(String),
     Node(NodeError),
@@ -33,6 +35,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ApiError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             ApiError::Upstream(m) => (StatusCode::BAD_GATEWAY, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
             // The node accepted the connection but rejected the request

@@ -67,6 +67,8 @@ pub struct Caches {
     pub hashrate: TtlCell<f64>,
     pub block_reward: TtlCell<f64>,
     pub market: TtlCell<serde_json::Value>,
+    pub node_version: TtlCell<String>,
+    pub ai_providers: TtlCell<serde_json::Value>,
 }
 
 impl Default for Caches {
@@ -78,6 +80,12 @@ impl Default for Caches {
             hashrate: TtlCell::new(Duration::from_secs(30)),
             block_reward: TtlCell::new(Duration::from_secs(30)),
             market: TtlCell::new(Duration::from_secs(30)),
+            node_version: TtlCell::new(Duration::from_secs(30)),
+            // keryx-labs.com's /infer page polls providers every 10 s per
+            // user, and each answer is two cohort walks on the node. A few
+            // seconds of staleness is within the cohort tolerance a request
+            // is sealed against.
+            ai_providers: TtlCell::new(Duration::from_secs(3)),
         }
     }
 }

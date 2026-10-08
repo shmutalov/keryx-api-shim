@@ -19,14 +19,28 @@ use crate::node::NodeClient;
 const SINK_HASH: &str = "ee00000000000000000000000000000000000000000000000000000000000011";
 const TXID: &str = "aa11223344556677889900aabbccddeeff00112233445566778899aabbccddee";
 const BROADCAST_TXID: &str = "cc00000000000000000000000000000000000000000000000000000000000022";
+const QWEN3_5_9B: &str = "bd34568cd89f5f19c6c3a6e1a61b929bc868709409eaad8e672d85f3c1eb5710";
+const QWEN3_8_27B: &str = "73740b443bdc00afda5fa34eb9999d3fea77dcc3f6de238fab701394cdc96fb3";
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct MockNode {
     /// Last transaction received via SubmitTransaction, for wire assertions.
     submitted: Arc<Mutex<Option<proto::RpcTransaction>>>,
+    /// What GetServerInfo reports.
+    server_version: String,
+    /// `windowDaa` of every GetServiceProviders received.
+    provider_calls: Arc<Mutex<Vec<Option<u64>>>>,
 }
 
 impl MockNode {
+    fn new(server_version: &str) -> Self {
+        Self {
+            submitted: Arc::default(),
+            server_version: server_version.into(),
+            provider_calls: Arc::default(),
+        }
+    }
+
     fn respond(&self, request: KaspadRequest) -> KaspadResponse {
         use kaspad_request::Payload as Req;
         use kaspad_response::Payload as Resp;
@@ -131,11 +145,32 @@ impl MockNode {
                 Resp::GetServerInfoResponse(proto::GetServerInfoResponseMessage {
                     rpc_api_version: 1,
                     rpc_api_revision: 0,
-                    server_version: "1.3.1-mock".into(),
+                    server_version: self.server_version.clone(),
                     network_id: "keryx-simnet".into(),
                     has_utxo_index: true,
                     is_synced: true,
                     virtual_daa_score: 123_456,
+                    error: None,
+                })
+            }
+            Req::GetServiceProvidersRequest(req) => {
+                self.provider_calls.lock().unwrap().push(req.window_daa);
+                let provider =
+                    |tier: u32, model_id: &str, key: &str| proto::ServiceProviderMessage {
+                        tier,
+                        model_id: model_id.into(),
+                        identity: key.repeat(32),
+                        escrow_pubkey: key.repeat(16),
+                    };
+                // The eligibility cohort; a wider window adds a miner that
+                // proved a block a little earlier.
+                let mut providers = vec![provider(0, QWEN3_5_9B, "a1")];
+                if req.window_daa.is_some() {
+                    providers.push(provider(3, QWEN3_8_27B, "b2"));
+                }
+                Resp::GetServiceProvidersResponse(proto::GetServiceProvidersResponseMessage {
+                    virtual_daa_score: 123_456,
+                    providers,
                     error: None,
                 })
             }
@@ -170,15 +205,17 @@ impl Rpc for MockNode {
     }
 }
 
-async fn spawn_stack() -> (String, Arc<Mutex<Option<proto::RpcTransaction>>>) {
+/// The shim wired to a mock node reporting `node_version`; returns the shim's
+/// base URL and the mock, whose recorders the test can inspect.
+async fn spawn_stack(node_version: &str) -> (String, MockNode) {
     // Mock node on an ephemeral port.
     let node_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let node_addr: SocketAddr = node_listener.local_addr().unwrap();
-    let mock = MockNode::default();
-    let submitted = mock.submitted.clone();
+    let mock = MockNode::new(node_version);
+    let served = mock.clone();
     tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(RpcServer::new(mock))
+            .add_service(RpcServer::new(served))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                 node_listener,
             ))
@@ -206,7 +243,7 @@ async fn spawn_stack() -> (String, Arc<Mutex<Option<proto::RpcTransaction>>>) {
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    (base, submitted)
+    (base, mock)
 }
 
 fn test_address() -> String {
@@ -215,7 +252,8 @@ fn test_address() -> String {
 
 #[tokio::test]
 async fn wallet_contract_end_to_end() {
-    let (base, submitted) = spawn_stack().await;
+    let (base, mock) = spawn_stack("1.3.1-mock").await;
+    let submitted = mock.submitted.clone();
     let http = reqwest::Client::new();
     let address = test_address();
 
@@ -412,4 +450,60 @@ async fn wallet_contract_end_to_end() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     assert!(resp.json::<serde_json::Value>().await.unwrap()["error"].is_string());
+}
+
+#[tokio::test]
+async fn ai_providers_end_to_end() {
+    let http = reqwest::Client::new();
+
+    // A 1.6.4 node: the eligibility cohort plus the 18 000-DAA window, in
+    // keryx-labs.com's /ai/providers shape.
+    let (base, mock) = spawn_stack("1.6.4").await;
+    let providers: serde_json::Value = http
+        .get(format!("{base}/api/v1/ai/providers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let provider = |tier: u32, model: &str, model_id: &str, key: &str| {
+        serde_json::json!({
+            "tier": tier, "model": model, "model_id": model_id,
+            "identity": key.repeat(32), "escrow_pubkey": key.repeat(16),
+        })
+    };
+    let a1 = provider(0, "qwen3.5-9b-abliterated", QWEN3_5_9B, "a1");
+    let b2 = provider(3, "qwen3.8-27b", QWEN3_8_27B, "b2");
+    assert_eq!(
+        providers,
+        serde_json::json!({
+            "virtual_daa_score": 123_456,
+            "window_daa": 18_000,
+            "cohort": [a1.clone()],
+            "window": [a1, b2],
+        })
+    );
+    let mut calls = mock.provider_calls.lock().unwrap().clone();
+    calls.sort();
+    assert_eq!(calls, vec![None, Some(18_000)]);
+
+    // An older node would drop the whole stream on the unknown request, so the
+    // shim refuses with 503 without ever sending it.
+    let (base, mock) = spawn_stack("1.6.3").await;
+    let resp = http
+        .get(format!("{base}/api/v1/ai/providers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+    let error = resp.json::<serde_json::Value>().await.unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("1.6.3") && error.contains("1.6.4"),
+        "{error}"
+    );
+    assert!(mock.provider_calls.lock().unwrap().is_empty());
 }

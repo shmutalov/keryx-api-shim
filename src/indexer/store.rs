@@ -539,7 +539,7 @@ impl Store {
                                         };
                                         ai_req_t.insert(ai_req_seq, enc(&rec).as_slice())?;
                                         ai_req_hash_t.insert(rhash.as_str(), ai_req_seq)?;
-                                        // Also addressable by tx id (/infer/{tx_id}).
+                                        // Also addressable by tx id (/inference/{tx_id}).
                                         ai_req_hash_t.insert(raw.tx_id.as_str(), ai_req_seq)?;
                                         ai_req_seq += 1;
                                     }
@@ -552,7 +552,7 @@ impl Store {
                                     let resp_hash = inference::request_hash(&bytes);
                                     // Every responder a private request is sealed to
                                     // must answer it (H14), each under its own key, so
-                                    // keep them all for /infer/{tx_id} and summarise
+                                    // keep them all for /inference/{tx_id} and summarise
                                     // the first accepted for the feed.
                                     ai_resp_list_t.insert(
                                         resp_list_key(&resp.request_hash, tx_num).as_slice(),

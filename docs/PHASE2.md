@@ -303,40 +303,55 @@ On-chain mechanics (from keryx-node `inference/src/ai_payload.rs`):
     (`00 'K' 'X' 'P' 01 | ephemeral key | nonce | n | n × (escrow key, wrapped
     root key) | ciphertext`) readable only by the tier cohort it names;
     plaintext requests are invalid, and the payload cap rises to 64 KiB. The
-    shim never renders the ciphertext: `prompt: ""`, `private: true`,
-    `recipient_count` from the envelope layout.
+    shim never renders the ciphertext: `prompt: ""`, `sealed: true`,
+    `sealed_recipients` from the envelope layout (keryx-labs.com's names for
+    the node's "private" request and its recipients).
   - Each named responder must answer (silent ones are struck), each sealing
     the answer under its own key and carrying it **inline**: a V2 head +
     `[0x80][len: 4 LE][body ≤ 32 KiB]`. The CID field is then just the body's
     sha2-256 multihash (not pinned). One horizon (72 000 DAA) after the gate a
     body-less response is invalid. The store keeps **every** response per
     request (`ai_resp_list`, `request_hash‖FF‖tx_num`) for
-    `GET /infer/{tx_id}`, which returns each `body` hex with
-    `responder_pubkey`; the feed summarises the first accepted
-    (`result_inline`, `result_tx_id`, `responder_pubkey`). A body that is not
-    an envelope (`body_sealed: false`) is the miner's plaintext "could not
-    open" note. Decryption needs the requester's root key, `request_hash` and
-    `responder_pubkey`; it is the requester's job, never the shim's.
+    `GET /inference/{tx_id}`, whose `sealed_responses[]` carries each inline
+    `body` hex with its `responder_pubkey`, oldest first; the feed summarises
+    the first accepted (`result_daa_score`, plus shim extras `result_inline`,
+    `result_tx_id`, `responder_pubkey`). A body that does not open is the
+    miner's plaintext "could not open" note. Decryption needs the requester's
+    root key, the request tx id and `responder_pubkey`; it is the requester's
+    job, never the shim's. Path and field names follow keryx-labs.com, whose
+    `/infer` page already seals and opens H14 requests in the browser, so a
+    client works against either host. Omitted from the official shape:
+    `ipfs_url`, `result_status`, `result_fetch_attempts` (its server-side IPFS
+    fetch; the shim leaves IPFS to the client).
   - Tier 3 swaps Qwen3.6-27B → Qwen3.8-27B (`73740b44…`, key `qwen3.8-27b`,
     the miner's name); Qwen3.6-27B stays in the registry for old rows.
   - Fixed per-model reward floors, the IBD possession-proof rule and the new
-    PoM seed are node-only. `getServiceProviders` (the cohort a requester must
-    seal to) is vendored in the protos but **not proxied yet**: a pre-1.6.4
-    node drops the whole gRPC stream on an unknown request, so exposing it
-    needs a node-version guard.
+    PoM seed are node-only.
+  - `GET /ai/providers` proxies `getServiceProviders` in keryx-labs.com's
+    shape: `cohort` (the eligibility window a request is checked against) and
+    `window` (the last `window_daa` = 18 000 DAA, as keryx-cli seals to), each
+    `{tier, model, model_id, identity, escrow_pubkey}`, cached 3 s. A pre-1.6.4
+    node takes the unknown request for a protocol error and drops the whole
+    gRPC stream (in-flight calls and the indexer's subscriptions), so the
+    handler checks `getServerInfo.serverVersion` (cached 30 s) first and
+    answers 503 without sending it.
   - Store rows gained trailing fields; rows written by 0.3.0 decode through
     their legacy layout (`dec_compat`), so an upgrade keeps the window. Rows
     indexed by 0.3.0 are not addressable by tx id (it keyed requests by
     digest only); they age out with the window.
 
 Endpoints served from the indexer (else `[]`): `/capabilities`, `/infer`
-(joined feed, `request_hash`, `payload_prefix`, `result` CID,
-`result_text: null`, H14 fields), `/challenges`; `/infer/{tx_id}` (else 404).
-Inference rows respect the retention window. Verified: store unit tests drive
-real AiRequest/Response/Challenge/coinbase payloads through `apply()` and
-assert all reads + expiry, incl. routed (tx-id) joins, multi-responder inline
-bodies and 0.3.0-format rows; endpoints return well-formed `[]` live on the
-idle simnet (which runs no inference).
+(joined feed, `payload_prefix`, `result` CID, `result_text: null`, H14
+fields), `/challenges`; `/inference/{tx_id}` (else 404). `/ai/providers` is
+served live from the node. Inference rows respect the retention window.
+Verified: store unit tests drive real AiRequest/Response/Challenge/coinbase
+payloads through `apply()` and assert all reads + expiry, incl. routed (tx-id)
+joins, multi-responder inline bodies and 0.3.0-format rows; the indexer e2e
+test pushes a sealed request and two responses through the mock node and
+asserts `/infer` and `/inference/{tx_id}` over HTTP; the API e2e test asserts
+`/ai/providers` against a 1.6.4 mock and the 503 (request never sent) against
+a 1.6.3 one; endpoints return well-formed `[]` live on the idle simnet (which
+runs no inference).
 
 ## 12. Open questions
 
