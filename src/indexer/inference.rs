@@ -3,15 +3,21 @@
 //! Binary layouts are ported from `keryx-node/inference/src/ai_payload.rs`.
 //! Three subnetworks carry the inference protocol:
 //!   03 = AiRequest, 04 = AiResponse, 05 = AiChallenge.
-//! Requests and responses are joined by `request_hash =
-//! BLAKE2b-512(payload)[0..32]` (note: 512 truncated, over the raw payload —
-//! not BLAKE2b-256, not the tx id). The inference result text is off-chain
-//! (only the IPFS CID is on-chain); clients fetch it via the shim's /ipfs proxy.
+//! An AiResponse names its request by `request_hash`, the request's identity
+//! (see `request_identity`): `BLAKE2b-512(payload)[0..32]` before the node's H8
+//! gate (512 truncated, over the raw payload — not BLAKE2b-256), the request's
+//! transaction id from H8 on.
 //!
-//! Since the node's H8 gate (`reward_routing_activation`) an AiRequest no longer
-//! names its miner: `outputs[1]` is the keyless reward vault (see
+//! Since H8 (`reward_routing_activation`) an AiRequest no longer names its
+//! miner: `outputs[1]` is the keyless reward vault (see
 //! `INFERENCE_VAULT_SCRIPT_HEX`) and the reward is minted by a later coinbase to
 //! the first accepted responder. Pre-H8 rows carry a CSV escrow naming the miner.
+//!
+//! Since H14 (`private_inference_activation`) every AiRequest prompt is a sealed
+//! envelope only the tier's miners can open, and each answer travels inline in
+//! its AiResponse, sealed to the requester (`inference/src/private.rs`). Before
+//! H14 the prompt is plaintext and the answer is off-chain on IPFS (only its CID
+//! is on-chain); clients fetch it via the shim's /ipfs proxy.
 
 pub const SUBNET_AI_REQUEST: &str = "0300000000000000000000000000000000000000";
 pub const SUBNET_AI_RESPONSE: &str = "0400000000000000000000000000000000000000";
@@ -19,7 +25,60 @@ pub const SUBNET_AI_CHALLENGE: &str = "0500000000000000000000000000000000000000"
 
 const MIN_REQUEST_LEN: usize = 52;
 const RESPONSE_LEN: usize = 78;
+/// V2 (H6, signed): the 78 v1 bytes + `[escrow_pubkey: 32] [schnorr_sig: 64]`.
+const RESPONSE_V2_LEN: usize = RESPONSE_LEN + 32 + 64;
 const MIN_CHALLENGE_LEN: usize = 74;
+
+// --- private inference (H14), mirrors keryx-node inference/src/private.rs -----
+
+/// Leading bytes of a sealed prompt or answer: a NUL, so no UTF-8 prompt starts
+/// with it.
+const PRIVATE_MAGIC: [u8; 4] = [0x00, b'K', b'X', b'P'];
+const PRIVATE_VERSION: u8 = 1;
+const MAX_PRIVATE_RECIPIENTS: usize = 128;
+/// `[magic: 4] [version: 1] [ephemeral_pubkey: 33] [nonce: 12] [n_recipients: 1]`.
+const PRIVATE_REQUEST_HEADER_LEN: usize = 4 + 1 + 33 + 12 + 1;
+/// `[escrow_pubkey: 32] [wrapped_root_key: 32 + 16-byte tag]`.
+const PRIVATE_RECIPIENT_ENTRY_LEN: usize = 32 + 48;
+const PRIVATE_TAG_LEN: usize = 16;
+/// AiResponse extension kind carrying the inline (sealed) answer:
+/// `[0x80] [len: 4 LE] [body: len]` after the 174-byte V2 head.
+const RESPONSE_EXT_PRIVATE_BODY: u8 = 0x80;
+const RESPONSE_EXT_HEADER_LEN: usize = 1 + 4;
+const MAX_RESPONSE_PRIVATE_BODY_LEN: usize = 32 * 1024;
+
+/// Whether a prompt (or an inline answer body) is a private-inference envelope —
+/// the node's `PrivateRequestEnvelope::is_private`, the check its miners use.
+pub fn is_private(bytes: &[u8]) -> bool {
+    bytes.starts_with(&PRIVATE_MAGIC)
+}
+
+/// How many responders a sealed prompt names, from the envelope's own layout:
+/// supported version, 1..=128 recipients in strictly ascending key order, room
+/// for the ciphertext tag. `None` for a plaintext or malformed prompt. Point
+/// validity is not checked (no secp256k1 here) — the node already did that for
+/// every accepted request.
+pub fn private_recipient_count(prompt: &[u8]) -> Option<u32> {
+    if !is_private(prompt)
+        || prompt.len() < PRIVATE_REQUEST_HEADER_LEN
+        || prompt[4] != PRIVATE_VERSION
+    {
+        return None;
+    }
+    let n = prompt[PRIVATE_REQUEST_HEADER_LEN - 1] as usize;
+    if n == 0 || n > MAX_PRIVATE_RECIPIENTS {
+        return None;
+    }
+    let entries_end = PRIVATE_REQUEST_HEADER_LEN + n * PRIVATE_RECIPIENT_ENTRY_LEN;
+    if prompt.len() < entries_end + PRIVATE_TAG_LEN {
+        return None;
+    }
+    let keys = prompt[PRIVATE_REQUEST_HEADER_LEN..entries_end]
+        .chunks_exact(PRIVATE_RECIPIENT_ENTRY_LEN)
+        .map(|entry| &entry[..32]);
+    let ascending = keys.clone().zip(keys.skip(1)).all(|(a, b)| a < b);
+    ascending.then_some(n as u32)
+}
 
 /// Canonical keyless reward vault of a routed AiRequest (`OP_RETURN "aivault"`),
 /// hex. At/after the node's H8 gate (`reward_routing_activation`, mainnet DAA
@@ -37,17 +96,20 @@ pub fn is_inference_vault(script_hex: &str) -> bool {
 }
 
 // --- model registry (model_id hex → wallet key) -------------------------------
-// The H6 lineup. keryx-node keeps no on-chain *name* registry, only the model_id
+// The H14 lineup. keryx-node keeps no on-chain *name* registry, only the model_id
 // consensus constants (params.rs); these ids mirror those and the miner's
-// models.rs, and the keys mirror the wallet's src/lib/models.js. Keep all three
-// in lockstep. An id not listed here resolves to its raw hex (model_name()).
+// models.rs, and the keys mirror the miner's model names and the wallet's
+// src/lib/models.js. Keep them in lockstep. An id not listed here resolves to
+// its raw hex (model_name()).
 //
 // H6 (`POM_TIERS_H6`, gated by `pom_v3_activation`) keeps 5 tiers: tier 0 =
 // Qwen3.5-9B-abliterated (replaces BOTH Qwen3-8B and Mistral-7B), tier 1 =
 // GLM-4-9B (slides from position 2), tier 2 = gemma-4-12B-abliterated (NEW,
-// 16 GB cards), tiers 3-4 unchanged. The registry is name resolution only, not
-// a consensus table, so retired ids stay listed — the indexer window can still
-// straddle a fork gate and carry pre-fork AiRequests that must render by name.
+// 16 GB cards), tiers 3-4 unchanged. H14 (`POM_TIERS_H14`, gated by
+// `private_inference_activation`) swaps tier 3 only: Qwen3.8-27B replaces
+// Qwen3.6-27B. The registry is name resolution only, not a consensus table, so
+// retired ids stay listed — the indexer window can still straddle a fork gate
+// and carry pre-fork AiRequests that must render by name.
 
 const MODELS: &[(&str, &str)] = &[
     (
@@ -78,6 +140,11 @@ const MODELS: &[(&str, &str)] = &[
         "gemma-4-12b-abliterated",
     ),
     (
+        "73740b443bdc00afda5fa34eb9999d3fea77dcc3f6de238fab701394cdc96fb3",
+        "qwen3.8-27b",
+    ),
+    (
+        // retired at H14 (H4-H6 tier 3) — kept for historical AiRequest decode
         "b8bdc01fa407eab943e4fefc807483b39f8142785256049e1f559698a5284746",
         "qwen3.6-27b",
     ),
@@ -118,12 +185,27 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
 
 // --- request_hash (join key) --------------------------------------------------
 
-/// `BLAKE2b-512(payload)[0..32]`, hex — the value AiResponse/AiChallenge carry
-/// to reference a request, and the source of the wallet's `payload_prefix`
-/// (`= request_hash_hex[..16]`).
+/// `BLAKE2b-512(payload)[0..32]`, hex — a pre-H8 request's identity (and the
+/// key the shim files any AI payload under, e.g. a response's own hash).
 pub fn request_hash(payload: &[u8]) -> String {
     let digest = blake2b_simd::blake2b(payload);
     to_hex(&digest.as_bytes()[..32])
+}
+
+/// The identity an AiRequest is referenced by — what AiResponse/AiChallenge
+/// carry as `request_hash`, and the source of the wallet's `payload_prefix`
+/// (`= identity[..16]`). The node's service ledger switches it at H8
+/// (`reward_routing_activation`, judged at the accepting chain block): the
+/// payload digest before, the transaction id from H8 on, because identical
+/// payloads used to collide into one assignment. The same gate at the same DAA
+/// makes the keyless vault mandatory in `outputs[1]`, so `routed` (the request
+/// funds the vault) decides it without knowing the network's activation score.
+pub fn request_identity(tx_id: &str, payload: &[u8], routed: bool) -> String {
+    if routed {
+        tx_id.to_string()
+    } else {
+        request_hash(payload)
+    }
 }
 
 // --- AiRequest (03) -----------------------------------------------------------
@@ -134,19 +216,37 @@ pub struct AiRequest {
     pub max_tokens: u32,
     pub inference_reward: u64,
     pub priority_fee: u64,
+    /// Plaintext prompt; empty for a private request (the ciphertext means
+    /// nothing to anyone but the tier's miners, so it is never rendered).
     pub prompt: String,
+    /// The prompt is a sealed private-inference envelope (H14).
+    pub private: bool,
+    /// Responders a private prompt is sealed to (`None` if not parseable).
+    pub recipient_count: Option<u32>,
 }
 
 pub fn decode_request(payload: &[u8]) -> Option<AiRequest> {
     if payload.len() < MIN_REQUEST_LEN {
         return None;
     }
+    let prompt = &payload[52..];
+    let private = is_private(prompt);
     Some(AiRequest {
         model_id: to_hex(&payload[0..32]),
         max_tokens: u32::from_le_bytes(payload[32..36].try_into().unwrap()),
         inference_reward: u64::from_le_bytes(payload[36..44].try_into().unwrap()),
         priority_fee: u64::from_le_bytes(payload[44..52].try_into().unwrap()),
-        prompt: String::from_utf8_lossy(&payload[52..]).into_owned(),
+        prompt: if private {
+            String::new()
+        } else {
+            String::from_utf8_lossy(prompt).into_owned()
+        },
+        private,
+        recipient_count: if private {
+            private_recipient_count(prompt)
+        } else {
+            None
+        },
     })
 }
 
@@ -156,19 +256,38 @@ pub fn decode_request(payload: &[u8]) -> Option<AiRequest> {
 pub struct AiResponse {
     pub request_hash: String,
     pub challenge_window_end: u64,
-    /// IPFS CIDv0 ("Qm…") of the off-chain result.
+    /// IPFS CIDv0 ("Qm…") of the off-chain result. With an inline body (H14)
+    /// it is the body's sha2-256 multihash and need not be pinned anywhere.
     pub cid: String,
     pub response_length: u32,
+    /// V2 (H6+) responder escrow x-only pubkey, hex — what the answer is sealed
+    /// under (`k_response` is derived per responder).
+    pub responder_pubkey: Option<String>,
+    /// Inline answer body (H14 extension): a private-inference envelope sealed
+    /// to the requester, or plaintext when the responder could not open the
+    /// request (the miner's documented "could not open" reply).
+    pub private_body: Option<Vec<u8>>,
 }
 
 pub fn decode_response(payload: &[u8]) -> Option<AiResponse> {
-    // H6 V2 responses append [escrow_pubkey: 32][schnorr_sig: 64] after the 78
-    // v1 bytes (ai_payload.rs `AI_RESPONSE_PAYLOAD_V2_LEN` = 174). The v1 fields
-    // sit at the same offsets, so `>=` decodes both eras; the responder identity
-    // is consensus-only and not surfaced in the feed.
+    // V2 responses (H6) append [escrow_pubkey: 32][schnorr_sig: 64] after the
+    // 78 v1 bytes; from H14 a V2 head may be followed by one extension
+    // [0x80][len: 4 LE][body] carrying the answer inline. The v1 fields sit at
+    // the same offsets in every era, so `>=` decodes them all; an extension
+    // that does not account for every trailing byte is ignored rather than
+    // failing the whole response (the node has already judged validity).
     if payload.len() < RESPONSE_LEN {
         return None;
     }
+    let responder_pubkey = (payload.len() >= RESPONSE_V2_LEN).then(|| to_hex(&payload[78..110]));
+    let private_body = payload
+        .get(RESPONSE_V2_LEN..)
+        .filter(|ext| ext.len() > RESPONSE_EXT_HEADER_LEN && ext[0] == RESPONSE_EXT_PRIVATE_BODY)
+        .and_then(|ext| {
+            let len = u32::from_le_bytes(ext[1..5].try_into().unwrap()) as usize;
+            let body = &ext[RESPONSE_EXT_HEADER_LEN..];
+            (len == body.len() && len <= MAX_RESPONSE_PRIVATE_BODY_LEN).then(|| body.to_vec())
+        });
     // bytes [40..74] are the raw multihash (0x12 0x20 || 32-byte sha2-256);
     // base58btc of that is the CIDv0.
     let cid = bs58::encode(&payload[40..74]).into_string();
@@ -177,6 +296,8 @@ pub fn decode_response(payload: &[u8]) -> Option<AiResponse> {
         challenge_window_end: u64::from_le_bytes(payload[32..40].try_into().unwrap()),
         cid,
         response_length: u32::from_le_bytes(payload[74..78].try_into().unwrap()),
+        responder_pubkey,
+        private_body,
     })
 }
 
@@ -292,8 +413,86 @@ mod tests {
         assert_eq!(r.inference_reward, 60_000_000);
         assert_eq!(r.priority_fee, 30_000_000);
         assert_eq!(r.prompt, "hello world");
+        assert!(!r.private);
+        assert_eq!(r.recipient_count, None);
         // too short → None
         assert!(decode_request(&p[..40]).is_none());
+    }
+
+    /// A sealed prompt as keryx-node `PrivateRequestEnvelope::serialize` lays
+    /// it out, with `keys` as the recipient escrow pubkeys (in the given order).
+    fn sealed_prompt(keys: &[[u8; 32]], ciphertext_len: usize) -> Vec<u8> {
+        let mut p = PRIVATE_MAGIC.to_vec();
+        p.push(PRIVATE_VERSION);
+        p.push(0x02); // ephemeral pubkey (compressed, even Y)
+        p.extend_from_slice(&[0x5a; 32]);
+        p.extend_from_slice(&[0x6b; 12]); // nonce
+        p.push(keys.len() as u8);
+        for k in keys {
+            p.extend_from_slice(k);
+            p.extend_from_slice(&[0x7c; 48]); // wrapped root key
+        }
+        p.extend(std::iter::repeat_n(0xee, ciphertext_len));
+        p
+    }
+
+    #[test]
+    fn private_request_hides_the_ciphertext_and_counts_recipients() {
+        let keys = [[0x11u8; 32], [0x22u8; 32], [0x33u8; 32]];
+        let prompt = sealed_prompt(&keys, PRIVATE_TAG_LEN + 40);
+        assert_eq!(private_recipient_count(&prompt), Some(3));
+
+        let mut p = vec![0xabu8; 32];
+        p.extend_from_slice(&le_u32(512));
+        p.extend_from_slice(&le_u64(50_000_000));
+        p.extend_from_slice(&le_u64(30_000_000));
+        p.extend_from_slice(&prompt);
+        let r = decode_request(&p).unwrap();
+        assert!(r.private);
+        assert_eq!(r.recipient_count, Some(3));
+        assert_eq!(r.prompt, "", "ciphertext is never rendered as text");
+        assert_eq!(r.max_tokens, 512);
+
+        // Layout checks: the bare tag fits, one byte short of it does not;
+        // unordered or duplicate keys, an unknown version and zero recipients
+        // are not a parseable envelope — but still private (never rendered).
+        assert_eq!(
+            private_recipient_count(&sealed_prompt(&keys, PRIVATE_TAG_LEN)),
+            Some(3)
+        );
+        assert_eq!(
+            private_recipient_count(&sealed_prompt(&keys, PRIVATE_TAG_LEN - 1)),
+            None
+        );
+        assert_eq!(
+            private_recipient_count(&sealed_prompt(&[keys[1], keys[0]], 16)),
+            None
+        );
+        assert_eq!(
+            private_recipient_count(&sealed_prompt(&[keys[0], keys[0]], 16)),
+            None
+        );
+        assert_eq!(private_recipient_count(&sealed_prompt(&[], 16)), None);
+        let mut v2 = prompt.clone();
+        v2[4] = 2;
+        assert_eq!(private_recipient_count(&v2), None);
+        assert!(is_private(&v2));
+        // A plaintext prompt is never private.
+        assert!(!is_private(b"KXP plain"));
+        assert_eq!(private_recipient_count(b"hello"), None);
+    }
+
+    #[test]
+    fn request_identity_is_the_txid_once_routed() {
+        let payload = b"same payload";
+        let txid = "ab".repeat(32);
+        // Pre-H8 (CSV escrow): the payload digest, regardless of tx id.
+        assert_eq!(
+            request_identity(&txid, payload, false),
+            request_hash(payload)
+        );
+        // H8+ (vault): the tx id — what the miner puts in AiResponse.request_hash.
+        assert_eq!(request_identity(&txid, payload, true), txid);
     }
 
     #[test]
@@ -325,14 +524,53 @@ mod tests {
         assert_eq!(r.response_length, 256);
         assert!(r.cid.starts_with("Qm"), "CIDv0 starts with Qm: {}", r.cid);
         assert_eq!(r.cid.len(), 46);
+        assert_eq!(r.responder_pubkey, None);
+        assert_eq!(r.private_body, None);
 
         // H6 V2 payload (78 + 32 pubkey + 64 sig = 174 bytes): the v1 fields
-        // decode identically from the same offsets.
+        // decode identically from the same offsets, plus the responder key.
         let mut v2 = p.clone();
         v2.extend_from_slice(&[0x44u8; 32]);
         v2.extend_from_slice(&[0x55u8; 64]);
-        assert_eq!(v2.len(), 174);
-        assert_eq!(decode_response(&v2).unwrap(), r);
+        assert_eq!(v2.len(), RESPONSE_V2_LEN);
+        let r2 = decode_response(&v2).unwrap();
+        assert_eq!(
+            r2.responder_pubkey.as_deref(),
+            Some("44".repeat(32).as_str())
+        );
+        assert_eq!(r2.private_body, None);
+        assert_eq!(
+            AiResponse {
+                responder_pubkey: None,
+                ..r2.clone()
+            },
+            r
+        );
+
+        // H14: V2 head + [0x80][len LE][body] carries the sealed answer inline.
+        let body = [&PRIVATE_MAGIC[..], &[PRIVATE_VERSION], &[0x9du8; 12 + 30]].concat();
+        let mut v3 = v2.clone();
+        v3.push(RESPONSE_EXT_PRIVATE_BODY);
+        v3.extend_from_slice(&le_u32(body.len() as u32));
+        v3.extend_from_slice(&body);
+        let r3 = decode_response(&v3).unwrap();
+        assert_eq!(r3.private_body.as_deref(), Some(body.as_slice()));
+        assert_eq!(
+            AiResponse {
+                private_body: None,
+                ..r3
+            },
+            r2
+        );
+
+        // An extension that does not account for every trailing byte, or of
+        // an unknown kind, yields no body (the v1 fields still decode).
+        let mut short = v3.clone();
+        short.pop();
+        assert_eq!(decode_response(&short).unwrap().private_body, None);
+        let mut kind = v3.clone();
+        kind[RESPONSE_V2_LEN] = 0x01; // pipeline-link count range, not a body
+        assert_eq!(decode_response(&kind).unwrap().private_body, None);
     }
 
     #[test]
@@ -405,6 +643,16 @@ mod tests {
         assert_eq!(
             model_key("399984045600f7d58d1b2cf01e6a4bf466fa15c7ac31bd0dd1a71e003b617cc6"),
             Some("gemma-4-12b-abliterated")
+        );
+        // H14 tier 3 (POM_TIERS_H14[3], QWEN3_8_27B_MODEL_ID) and the tier-3
+        // model it retires.
+        assert_eq!(
+            model_key("73740b443bdc00afda5fa34eb9999d3fea77dcc3f6de238fab701394cdc96fb3"),
+            Some("qwen3.8-27b")
+        );
+        assert_eq!(
+            model_key("b8bdc01fa407eab943e4fefc807483b39f8142785256049e1f559698a5284746"),
+            Some("qwen3.6-27b")
         );
         // Retired pre-fork tier-0s (H5's Qwen3-8B, H4's EXAONE) still resolve
         // for historical decode, case-insensitively.

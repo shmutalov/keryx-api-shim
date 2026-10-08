@@ -253,7 +253,8 @@ On-chain mechanics (from keryx-node `inference/src/ai_payload.rs`):
   prompt), **04** AiResponse (request_hash, IPFS CIDv0, length), **05**
   AiChallenge (response_hash, proof_data = request_hash).
 - **`request_hash = BLAKE2b-512(payload)[0..32]`** (512 truncated over the raw
-  payload — not 256, not the tx id). `payload_prefix = request_hash_hex[..16]`.
+  payload — not 256) until H8; **the request's tx id** from H8 on (see the H8
+  bullet below). `payload_prefix = request_hash_hex[..16]`.
 - Requests↔responses join on `request_hash`; the **result text is off-chain**
   (only the CIDv0 is on-chain — clients fetch it via the shim's `/ipfs/{cid}`).
 - `/capabilities` comes from coinbase `extra_data` markers
@@ -273,8 +274,9 @@ On-chain mechanics (from keryx-node `inference/src/ai_payload.rs`):
   Mistral-7B) stay in the table so pre-fork rows still render by name.
 - H6 also introduced **V2 AiResponses** (`ai_payload.rs`): 78 v1 bytes +
   `[escrow_pubkey: 32][schnorr_sig: 64]` = 174 bytes. `decode_response`
-  accepts both lengths (v1 fields sit at the same offsets); the responder
-  identity is consensus-only and not surfaced in the feed.
+  accepts both lengths (v1 fields sit at the same offsets); the responder's
+  escrow pubkey is surfaced as `responder_pubkey` (an H14 answer is sealed
+  under it). The signature is not verified — the node already judged it.
 - **H8 reward routing** (keryx-node `reward_routing_activation`, mainnet DAA
   79 210 000, testnet from genesis, never on simnet/devnet): `AiRequest.outputs[1]`
   must be the keyless vault `OP_RETURN "aivault"`
@@ -282,20 +284,59 @@ On-chain mechanics (from keryx-node `inference/src/ai_payload.rs`):
   miner; a later coinbase mints the reward to the first accepted responder, or
   it burns. The store recognises the vault (`is_inference_vault`) and records
   `miner_pubkey: None` for routed requests; pre-H8 rows keep their CSV
-  attribution. Nothing else the shim reads changed between H7 and H13
-  (keryx-node v1.6.1): the tier table is still `POM_TIERS_H6`, the 03/04/05
-  payload layouts and coinbase markers are unchanged, and H9-H13 are node-only
-  consensus gates (PoM v4 re-walk seed, service-ledger and production-index
-  snapshots, exact verification). Vendored protos refreshed to v1.6.1 (new
-  header fields `serviceStateHash`/`pomTier`, `getUtxoCountByAddress`,
-  `getUtxoEntriesByOutpoints`, `getServiceStrikes`), none used yet.
+  attribution. The same gate also switched the **request identity**
+  (keryx-node `service_bond.rs`, `txid_identity`; the miner mirrors it): from
+  H8 a request is named by its **tx id** in `AiResponse.request_hash` and in
+  the service ledger, because identical payloads used to collide into one
+  assignment. Both rules are judged at the accepting chain block's DAA, so the
+  store derives the identity from the vault itself
+  (`inference::request_identity`) — no per-network activation table. Shim
+  0.3.0 missed this and joined routed requests by payload digest, so their
+  responses never showed; the feed now also tries the tx id, which repairs
+  rows that release indexed. H9-H13 are node-only consensus gates (PoM v4
+  re-walk seed, service-ledger and production-index snapshots, exact
+  verification).
+- **H14 private inference** (keryx-node v1.6.4 `private_inference_activation`,
+  mainnet DAA 121 985 000 ≈ 2026-10-09 14:00 UTC, testnet 6 000, never on
+  simnet/devnet; `inference/src/private.rs`, `docs/private-inference.md`):
+  - Every AiRequest prompt must be a sealed envelope
+    (`00 'K' 'X' 'P' 01 | ephemeral key | nonce | n | n × (escrow key, wrapped
+    root key) | ciphertext`) readable only by the tier cohort it names;
+    plaintext requests are invalid, and the payload cap rises to 64 KiB. The
+    shim never renders the ciphertext: `prompt: ""`, `private: true`,
+    `recipient_count` from the envelope layout.
+  - Each named responder must answer (silent ones are struck), each sealing
+    the answer under its own key and carrying it **inline**: a V2 head +
+    `[0x80][len: 4 LE][body ≤ 32 KiB]`. The CID field is then just the body's
+    sha2-256 multihash (not pinned). One horizon (72 000 DAA) after the gate a
+    body-less response is invalid. The store keeps **every** response per
+    request (`ai_resp_list`, `request_hash‖FF‖tx_num`) for
+    `GET /infer/{tx_id}`, which returns each `body` hex with
+    `responder_pubkey`; the feed summarises the first accepted
+    (`result_inline`, `result_tx_id`, `responder_pubkey`). A body that is not
+    an envelope (`body_sealed: false`) is the miner's plaintext "could not
+    open" note. Decryption needs the requester's root key, `request_hash` and
+    `responder_pubkey`; it is the requester's job, never the shim's.
+  - Tier 3 swaps Qwen3.6-27B → Qwen3.8-27B (`73740b44…`, key `qwen3.8-27b`,
+    the miner's name); Qwen3.6-27B stays in the registry for old rows.
+  - Fixed per-model reward floors, the IBD possession-proof rule and the new
+    PoM seed are node-only. `getServiceProviders` (the cohort a requester must
+    seal to) is vendored in the protos but **not proxied yet**: a pre-1.6.4
+    node drops the whole gRPC stream on an unknown request, so exposing it
+    needs a node-version guard.
+  - Store rows gained trailing fields; rows written by 0.3.0 decode through
+    their legacy layout (`dec_compat`), so an upgrade keeps the window. Rows
+    indexed by 0.3.0 are not addressable by tx id (it keyed requests by
+    digest only); they age out with the window.
 
 Endpoints served from the indexer (else `[]`): `/capabilities`, `/infer`
-(joined feed, `payload_prefix`, `result` CID, `result_text: null`),
-`/challenges`. Inference rows respect the retention window. Verified: store
-unit tests drive real AiRequest/Response/Challenge/coinbase payloads through
-`apply()` and assert all three reads + expiry; endpoints return well-formed
-`[]` live on the idle simnet (which runs no inference).
+(joined feed, `request_hash`, `payload_prefix`, `result` CID,
+`result_text: null`, H14 fields), `/challenges`; `/infer/{tx_id}` (else 404).
+Inference rows respect the retention window. Verified: store unit tests drive
+real AiRequest/Response/Challenge/coinbase payloads through `apply()` and
+assert all reads + expiry, incl. routed (tx-id) joins, multi-responder inline
+bodies and 0.3.0-format rows; endpoints return well-formed `[]` live on the
+idle simnet (which runs no inference).
 
 ## 12. Open questions
 

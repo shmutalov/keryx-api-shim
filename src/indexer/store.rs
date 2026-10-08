@@ -37,8 +37,9 @@ const META: TableDefinition<&str, u64> = TableDefinition::new("meta_u64");
 const META_STR: TableDefinition<&str, &str> = TableDefinition::new("meta_str");
 // AI inference subsystem (phase 2c)
 const AI_REQ: TableDefinition<u64, &[u8]> = TableDefinition::new("ai_req"); // req_seq -> AiRequestRec
-const AI_REQ_BY_HASH: TableDefinition<&str, u64> = TableDefinition::new("ai_req_by_hash"); // request_hash -> seq
-const AI_RESP: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_resp"); // request_hash -> AiResponseRec
+const AI_REQ_BY_HASH: TableDefinition<&str, u64> = TableDefinition::new("ai_req_by_hash"); // request_hash, tx_id -> seq
+const AI_RESP: TableDefinition<&str, &[u8]> = TableDefinition::new("ai_resp"); // request_hash -> first AiResponseRec
+const AI_RESP_LIST: TableDefinition<&[u8], ()> = TableDefinition::new("ai_resp_list"); // request_hash||FF||tx_num
 const AI_RESP_HASH: TableDefinition<&str, &str> = TableDefinition::new("ai_resp_hash"); // response_hash -> request_hash
 const AI_CHAL: TableDefinition<u64, &[u8]> = TableDefinition::new("ai_chal"); // chal_seq -> AiChallengeRec
 const AI_CAPS: TableDefinition<&[u8], u64> = TableDefinition::new("ai_caps"); // model_id||FF||pubkey -> last_seen_daa
@@ -172,16 +173,93 @@ pub struct AiRequestRec {
     pub prompt: String,
     pub daa_score: u64,
     pub block_hash: String,
+    /// The request's identity, as its responses reference it
+    /// (`inference::request_identity`). Rows written by shim 0.3.0 carry the
+    /// payload digest even for a routed (H8+) request.
     pub request_hash: String,
     pub miner_pubkey: Option<String>,
+    // --- appended after 0.3.0 (its rows decode via AiRequestRecV1) ---
+    pub private: bool,
+    pub recipient_count: Option<u32>,
 }
 
+/// The `AiRequestRec` layout written by shim 0.3.0.
+#[derive(Deserialize)]
+struct AiRequestRecV1 {
+    tx_id: String,
+    model_id: String,
+    max_tokens: u32,
+    inference_reward: u64,
+    priority_fee: u64,
+    prompt: String,
+    daa_score: u64,
+    block_hash: String,
+    request_hash: String,
+    miner_pubkey: Option<String>,
+}
+
+impl From<AiRequestRecV1> for AiRequestRec {
+    fn from(v: AiRequestRecV1) -> Self {
+        Self {
+            tx_id: v.tx_id,
+            model_id: v.model_id,
+            max_tokens: v.max_tokens,
+            inference_reward: v.inference_reward,
+            priority_fee: v.priority_fee,
+            prompt: v.prompt,
+            daa_score: v.daa_score,
+            block_hash: v.block_hash,
+            request_hash: v.request_hash,
+            miner_pubkey: v.miner_pubkey,
+            private: false,
+            recipient_count: None,
+        }
+    }
+}
+
+/// The first accepted response to a request — the feed's summary of it.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AiResponseRec {
     pub cid: String,
     pub result_block_hash: String,
     pub response_length: u32,
     pub daa_score: u64,
+    // --- appended after 0.3.0 (its rows decode via AiResponseRecV1) ---
+    pub tx_id: Option<String>,
+    pub responder_pubkey: Option<String>,
+    /// The answer travels inline in the response (H14), not on IPFS.
+    pub inline_body: bool,
+}
+
+/// The `AiResponseRec` layout written by shim 0.3.0.
+#[derive(Deserialize)]
+struct AiResponseRecV1 {
+    cid: String,
+    result_block_hash: String,
+    response_length: u32,
+    daa_score: u64,
+}
+
+impl From<AiResponseRecV1> for AiResponseRec {
+    fn from(v: AiResponseRecV1) -> Self {
+        Self {
+            cid: v.cid,
+            result_block_hash: v.result_block_hash,
+            response_length: v.response_length,
+            daa_score: v.daa_score,
+            tx_id: None,
+            responder_pubkey: None,
+            inline_body: false,
+        }
+    }
+}
+
+/// One request looked up by transaction id, with every indexed response to it
+/// (oldest first) — the requester's path to its sealed answer.
+pub struct InferenceDetail {
+    pub request: AiRequestRec,
+    pub first_response: Option<AiResponseRec>,
+    pub responses: Vec<(IndexedTx, inference::AiResponse)>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -250,6 +328,20 @@ fn chain_key(daa: u64, hash: &str) -> Vec<u8> {
     k
 }
 
+/// `request_hash || FF || tx_num` (BE) — the address-history key shape, so a
+/// request's responses range-scan in acceptance order.
+fn resp_list_key(request_hash: &str, tx_num: u64) -> Vec<u8> {
+    hist_key(request_hash, tx_num)
+}
+
+fn resp_list_bounds(request_hash: &str) -> (Vec<u8>, Vec<u8>) {
+    hist_bounds(request_hash)
+}
+
+fn resp_list_tx_num(key: &[u8]) -> u64 {
+    u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap())
+}
+
 fn caps_key(model_id: &str, pubkey: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(model_id.len() + 1 + pubkey.len());
     k.extend_from_slice(model_id.as_bytes());
@@ -264,6 +356,25 @@ fn enc<T: Serialize>(v: &T) -> Vec<u8> {
 
 fn dec<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, StoreError> {
     bincode::deserialize(b).map_err(|e| StoreError::Decode(e.to_string()))
+}
+
+/// Decode a row whose type gained trailing fields: a row written by an older
+/// shim ends before them, fails the full decode, and is read through its
+/// legacy layout `L` instead — so an upgrade keeps the indexed window.
+fn dec_compat<T, L>(b: &[u8]) -> Result<T, StoreError>
+where
+    T: serde::de::DeserializeOwned,
+    L: serde::de::DeserializeOwned + Into<T>,
+{
+    bincode::deserialize::<T>(b).or_else(|_| dec::<L>(b).map(Into::into))
+}
+
+fn dec_request(b: &[u8]) -> Result<AiRequestRec, StoreError> {
+    dec_compat::<AiRequestRec, AiRequestRecV1>(b)
+}
+
+fn dec_response(b: &[u8]) -> Result<AiResponseRec, StoreError> {
+    dec_compat::<AiResponseRec, AiResponseRecV1>(b)
 }
 
 // --- store --------------------------------------------------------------------
@@ -299,6 +410,7 @@ impl Store {
             write.open_table(AI_REQ)?;
             write.open_table(AI_REQ_BY_HASH)?;
             write.open_table(AI_RESP)?;
+            write.open_table(AI_RESP_LIST)?;
             write.open_table(AI_RESP_HASH)?;
             write.open_table(AI_CHAL)?;
             write.open_table(AI_CAPS)?;
@@ -331,6 +443,7 @@ impl Store {
             let mut ai_req_t = write.open_table(AI_REQ)?;
             let mut ai_req_hash_t = write.open_table(AI_REQ_BY_HASH)?;
             let mut ai_resp_t = write.open_table(AI_RESP)?;
+            let mut ai_resp_list_t = write.open_table(AI_RESP_LIST)?;
             let mut ai_resp_hash_t = write.open_table(AI_RESP_HASH)?;
             let mut ai_chal_t = write.open_table(AI_CHAL)?;
             let mut ai_caps_t = write.open_table(AI_CAPS)?;
@@ -391,24 +504,25 @@ impl Store {
                         inference::SUBNET_AI_REQUEST => {
                             if let Some(bytes) = inference::from_hex(&raw.payload) {
                                 if let Some(req) = inference::decode_request(&bytes) {
-                                    let rhash = inference::request_hash(&bytes);
+                                    // Pre-H8 outputs[1] is a CSV escrow naming the
+                                    // target miner. At/after H8 (reward routing) it is
+                                    // the keyless vault: the request targets nobody and
+                                    // the responder is only known from the AiResponse,
+                                    // so the attribution is None by design — and the
+                                    // request is identified by its tx id.
+                                    let escrow = raw.outputs.get(1);
+                                    let routed = escrow.is_some_and(|o| {
+                                        o.script_version == 0
+                                            && inference::is_inference_vault(&o.script_public_key)
+                                    });
+                                    let miner_pubkey = escrow.filter(|_| !routed).and_then(|o| {
+                                        inference::csv_escrow_pubkey(&o.script_public_key)
+                                    });
+                                    let rhash =
+                                        inference::request_identity(&raw.tx_id, &bytes, routed);
+                                    // A pre-H8 payload repeat is the same assignment to
+                                    // the node, so it is indexed once.
                                     if ai_req_hash_t.get(rhash.as_str())?.is_none() {
-                                        // Pre-H8 outputs[1] is a CSV escrow naming the
-                                        // target miner. At/after H8 (reward routing) it is
-                                        // the keyless vault: the request targets nobody and
-                                        // the responder is only known from the AiResponse,
-                                        // so the attribution is None by design.
-                                        let miner_pubkey = raw.outputs.get(1).and_then(|o| {
-                                            if o.script_version == 0
-                                                && inference::is_inference_vault(
-                                                    &o.script_public_key,
-                                                )
-                                            {
-                                                None
-                                            } else {
-                                                inference::csv_escrow_pubkey(&o.script_public_key)
-                                            }
-                                        });
                                         let rec = AiRequestRec {
                                             tx_id: raw.tx_id.clone(),
                                             model_id: req.model_id,
@@ -420,9 +534,13 @@ impl Store {
                                             block_hash: group.chain_block_hash.clone(),
                                             request_hash: rhash.clone(),
                                             miner_pubkey,
+                                            private: req.private,
+                                            recipient_count: req.recipient_count,
                                         };
                                         ai_req_t.insert(ai_req_seq, enc(&rec).as_slice())?;
                                         ai_req_hash_t.insert(rhash.as_str(), ai_req_seq)?;
+                                        // Also addressable by tx id (/infer/{tx_id}).
+                                        ai_req_hash_t.insert(raw.tx_id.as_str(), ai_req_seq)?;
                                         ai_req_seq += 1;
                                     }
                                 }
@@ -432,14 +550,29 @@ impl Store {
                             if let Some(bytes) = inference::from_hex(&raw.payload) {
                                 if let Some(resp) = inference::decode_response(&bytes) {
                                     let resp_hash = inference::request_hash(&bytes);
-                                    let rec = AiResponseRec {
-                                        cid: resp.cid,
-                                        result_block_hash: group.chain_block_hash.clone(),
-                                        response_length: resp.response_length,
-                                        daa_score: group.daa_score,
-                                    };
-                                    ai_resp_t
-                                        .insert(resp.request_hash.as_str(), enc(&rec).as_slice())?;
+                                    // Every responder a private request is sealed to
+                                    // must answer it (H14), each under its own key, so
+                                    // keep them all for /infer/{tx_id} and summarise
+                                    // the first accepted for the feed.
+                                    ai_resp_list_t.insert(
+                                        resp_list_key(&resp.request_hash, tx_num).as_slice(),
+                                        (),
+                                    )?;
+                                    if ai_resp_t.get(resp.request_hash.as_str())?.is_none() {
+                                        let rec = AiResponseRec {
+                                            cid: resp.cid,
+                                            result_block_hash: group.chain_block_hash.clone(),
+                                            response_length: resp.response_length,
+                                            daa_score: group.daa_score,
+                                            tx_id: Some(raw.tx_id.clone()),
+                                            responder_pubkey: resp.responder_pubkey,
+                                            inline_body: resp.private_body.is_some(),
+                                        };
+                                        ai_resp_t.insert(
+                                            resp.request_hash.as_str(),
+                                            enc(&rec).as_slice(),
+                                        )?;
+                                    }
                                     ai_resp_hash_t
                                         .insert(resp_hash.as_str(), resp.request_hash.as_str())?;
                                 }
@@ -670,24 +803,58 @@ impl Store {
             let mut ai_req_t = write.open_table(AI_REQ)?;
             let mut ai_req_hash_t = write.open_table(AI_REQ_BY_HASH)?;
             let mut ai_resp_t = write.open_table(AI_RESP)?;
+            let mut ai_resp_list_t = write.open_table(AI_RESP_LIST)?;
             let mut ai_resp_hash_t = write.open_table(AI_RESP_HASH)?;
             let mut ai_chal_t = write.open_table(AI_CHAL)?;
             let mut ai_caps_t = write.open_table(AI_CAPS)?;
 
-            let mut exp_req: Vec<(u64, String)> = Vec::new();
+            let mut exp_req: Vec<(u64, AiRequestRec)> = Vec::new();
             {
                 for item in ai_req_t.iter()? {
                     let (k, v) = item?;
-                    let rec: AiRequestRec = dec(v.value())?;
+                    let rec = dec_request(v.value())?;
                     if rec.daa_score < cutoff_daa {
-                        exp_req.push((k.value(), rec.request_hash));
+                        exp_req.push((k.value(), rec));
                     }
                 }
             }
-            for (seq, rhash) in &exp_req {
+            // Keyed by identity and by tx id; a row from shim 0.3.0 may have
+            // its (routed) response filed under the tx id.
+            for (seq, rec) in &exp_req {
                 ai_req_t.remove(seq)?;
-                ai_req_hash_t.remove(rhash.as_str())?;
-                ai_resp_t.remove(rhash.as_str())?;
+                for key in [rec.request_hash.as_str(), rec.tx_id.as_str()] {
+                    ai_req_hash_t.remove(key)?;
+                    ai_resp_t.remove(key)?;
+                }
+            }
+            // Responses below the cutoff too: a response is accepted after its
+            // request, so such a one belongs to an expired request or to one
+            // the shim never indexed (it predates the window).
+            let mut exp_resp: Vec<String> = Vec::new();
+            {
+                for item in ai_resp_t.iter()? {
+                    let (k, v) = item?;
+                    if dec_response(v.value())?.daa_score < cutoff_daa {
+                        exp_resp.push(k.value().to_string());
+                    }
+                }
+            }
+            for key in &exp_resp {
+                ai_resp_t.remove(key.as_str())?;
+            }
+            // Response-list entries whose transaction has expired (or was
+            // unwound by a reorg).
+            let mut exp_list: Vec<Vec<u8>> = Vec::new();
+            {
+                for item in ai_resp_list_t.iter()? {
+                    let (k, _) = item?;
+                    if tx_t.get(resp_list_tx_num(k.value()))?.is_none() {
+                        exp_list.push(k.value().to_vec());
+                    }
+                }
+            }
+            for key in &exp_list {
+                ai_resp_list_t.remove(key.as_slice())?;
             }
             // Response-hash mappings whose request is gone.
             let mut exp_rh: Vec<String> = Vec::new();
@@ -872,14 +1039,52 @@ impl Store {
             if out.len() >= limit {
                 break;
             }
-            let req: AiRequestRec = dec(v.value())?;
-            let resp = match resp_t.get(req.request_hash.as_str())? {
-                Some(g) => Some(dec::<AiResponseRec>(g.value())?),
-                None => None,
-            };
+            let req = dec_request(v.value())?;
+            let resp = first_response(&resp_t, &req)?;
             out.push((req, resp));
         }
         Ok(out)
+    }
+
+    /// One request by its transaction id, with every indexed response to it.
+    /// `None` when the shim has not indexed that request (outside the window,
+    /// not an AiRequest, or indexed by shim 0.3.0, which keyed requests by
+    /// payload digest only).
+    pub fn inference_by_tx(&self, tx_id: &str) -> Result<Option<InferenceDetail>, StoreError> {
+        let read = self.db.begin_read()?;
+        let Some(seq) = read
+            .open_table(AI_REQ_BY_HASH)?
+            .get(tx_id)?
+            .map(|g| g.value())
+        else {
+            return Ok(None);
+        };
+        let request = match read.open_table(AI_REQ)?.get(seq)? {
+            Some(g) => dec_request(g.value())?,
+            None => return Ok(None),
+        };
+        let first_response = first_response(&read.open_table(AI_RESP)?, &request)?;
+        let list_t = read.open_table(AI_RESP_LIST)?;
+        let tx_t = read.open_table(TX)?;
+        let (lo, hi) = resp_list_bounds(&request.request_hash);
+        let mut responses = Vec::new();
+        for item in list_t.range(lo.as_slice()..=hi.as_slice())? {
+            let (k, _) = item?;
+            let Some(g) = tx_t.get(resp_list_tx_num(k.value()))? else {
+                continue; // expired or unwound; the sweep drops the entry
+            };
+            let itx: IndexedTx = dec(g.value())?;
+            if let Some(resp) =
+                inference::from_hex(&itx.payload).and_then(|b| inference::decode_response(&b))
+            {
+                responses.push((itx, resp));
+            }
+        }
+        Ok(Some(InferenceDetail {
+            request,
+            first_response,
+            responses,
+        }))
     }
 
     /// Newest-first fraud challenges.
@@ -930,6 +1135,21 @@ impl Store {
         out.sort_by_key(|c| std::cmp::Reverse(c.last_seen_daa));
         Ok(out)
     }
+}
+
+/// The feed's response to a request: filed under its identity — or under its
+/// tx id for a routed request indexed by shim 0.3.0, which recorded the
+/// payload digest while its responses name the tx id.
+fn first_response(
+    resp_t: &impl ReadableTable<&'static str, &'static [u8]>,
+    req: &AiRequestRec,
+) -> Result<Option<AiResponseRec>, StoreError> {
+    for key in [req.request_hash.as_str(), req.tx_id.as_str()] {
+        if let Some(g) = resp_t.get(key)? {
+            return Ok(Some(dec_response(g.value())?));
+        }
+    }
+    Ok(None)
 }
 
 fn read_totals(
@@ -1391,27 +1611,34 @@ mod tests {
         assert_eq!(challenges.len(), 1);
         assert_eq!(challenges[0].tx_id, "chal1");
         assert_eq!(challenges[0].request_hash, req_hash);
+
+        // Also addressable by tx id, with its one (v1, IPFS) response.
+        let detail = s.inference_by_tx("req1").unwrap().expect("by tx id");
+        assert_eq!(detail.request.request_hash, req_hash);
+        assert_eq!(detail.responses.len(), 1);
+        assert_eq!(detail.responses[0].0.tx_id, "resp1");
+        assert_eq!(detail.responses[0].1.private_body, None);
     }
 
-    #[test]
-    fn routed_request_with_h8_vault_is_indexed_without_a_target_miner() {
-        let s = temp_store();
-        let model_id = "bd34568cd89f5f19c6c3a6e1a61b929bc868709409eaad8e672d85f3c1eb5710";
-        let mut req_payload = inference::from_hex(model_id).unwrap();
-        req_payload.extend_from_slice(&128u32.to_le_bytes());
-        req_payload.extend_from_slice(&60_000_000u64.to_le_bytes());
-        req_payload.extend_from_slice(&30_000_000u64.to_le_bytes());
-        req_payload.extend_from_slice(b"routed");
-        let req_hash = inference::request_hash(&req_payload);
-        // Post-H8 shape: outputs[1] is the keyless vault, not a CSV escrow.
-        let ai_request = RawTx {
-            tx_id: "reqRouted".into(),
+    fn ai_request_payload(model_id: &str, prompt: &[u8]) -> Vec<u8> {
+        let mut p = inference::from_hex(model_id).unwrap();
+        p.extend_from_slice(&128u32.to_le_bytes());
+        p.extend_from_slice(&60_000_000u64.to_le_bytes());
+        p.extend_from_slice(&30_000_000u64.to_le_bytes());
+        p.extend_from_slice(prompt);
+        p
+    }
+
+    /// A post-H8 AiRequest: change at outputs[0], the keyless vault at outputs[1].
+    fn routed_request(tx_id: &str, payload: &[u8]) -> RawTx {
+        RawTx {
+            tx_id: tx_id.into(),
             is_coinbase: false,
             version: 0,
             lock_time: 0,
             subnetwork_id: inference::SUBNET_AI_REQUEST.into(),
             gas: 0,
-            payload: inference::to_hex(&req_payload),
+            payload: inference::to_hex(payload),
             inputs: vec![],
             outputs: vec![
                 RawOut {
@@ -1425,20 +1652,251 @@ mod tests {
                     script_public_key: inference::INFERENCE_VAULT_SCRIPT_HEX.into(),
                 },
             ],
-        };
-        s.apply(&[group("blk1", 100, vec![ai_request])]).unwrap();
+        }
+    }
+
+    /// A V2 (signed) AiResponse naming `request_hash`, with an optional H14
+    /// inline body.
+    fn v2_response(tx_id: &str, request_hash: &str, responder: u8, body: Option<&[u8]>) -> RawTx {
+        let mut p = vec![0u8; 78];
+        p[0..32].copy_from_slice(&inference::from_hex(request_hash).unwrap());
+        p[40] = 0x12;
+        p[41] = 0x20;
+        p[74..78].copy_from_slice(&64u32.to_le_bytes());
+        p.extend_from_slice(&[responder; 32]); // escrow pubkey
+        p.extend_from_slice(&[0x55; 64]); // schnorr signature
+        if let Some(body) = body {
+            p.push(0x80);
+            p.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            p.extend_from_slice(body);
+        }
+        RawTx {
+            tx_id: tx_id.into(),
+            is_coinbase: false,
+            version: 0,
+            lock_time: 0,
+            subnetwork_id: inference::SUBNET_AI_RESPONSE.into(),
+            gas: 0,
+            payload: inference::to_hex(&p),
+            inputs: vec![],
+            outputs: vec![],
+        }
+    }
+
+    #[test]
+    fn routed_request_with_h8_vault_is_identified_by_its_tx_id() {
+        let s = temp_store();
+        let model_id = "bd34568cd89f5f19c6c3a6e1a61b929bc868709409eaad8e672d85f3c1eb5710";
+        let payload = ai_request_payload(model_id, b"routed");
+        let txid = "a1".repeat(32);
+        s.apply(&[group("blk1", 100, vec![routed_request(&txid, &payload)])])
+            .unwrap();
 
         let feed = s.inference_feed(10, 0).unwrap();
         assert_eq!(feed.len(), 1);
         let (req, resp) = &feed[0];
-        assert_eq!(req.tx_id, "reqRouted");
-        assert_eq!(req.request_hash, req_hash);
+        assert_eq!(req.tx_id, txid);
+        // From H8 the node and the miner reference a request by its tx id, not
+        // by the payload digest.
+        assert_eq!(req.request_hash, txid);
         assert_eq!(req.inference_reward, 60_000_000);
         // The vault names no miner; the responder is only known from the AiResponse.
         assert_eq!(req.miner_pubkey, None);
         assert!(resp.is_none());
         // The vault output is unattributed in the ledger (no address history row).
         assert_eq!(s.total_txs().unwrap(), 1);
+
+        // A V2 response naming the tx id joins; one naming the digest does not.
+        let digest = inference::request_hash(&payload);
+        s.apply(&[group(
+            "blk2",
+            101,
+            vec![
+                v2_response(&"b1".repeat(32), &digest, 0x44, None),
+                v2_response(&"b2".repeat(32), &txid, 0x45, None),
+            ],
+        )])
+        .unwrap();
+        let feed = s.inference_feed(10, 0).unwrap();
+        let resp = feed[0].1.as_ref().expect("joined by tx id");
+        assert_eq!(resp.tx_id.as_deref(), Some("b2".repeat(32).as_str()));
+        assert_eq!(
+            resp.responder_pubkey.as_deref(),
+            Some("45".repeat(32).as_str())
+        );
+        assert!(!resp.inline_body);
+
+        // Two senders of an identical payload are two requests past H8.
+        s.apply(&[group(
+            "blk3",
+            102,
+            vec![routed_request(&"a2".repeat(32), &payload)],
+        )])
+        .unwrap();
+        assert_eq!(s.inference_feed(10, 0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn private_request_keeps_every_inline_answer() {
+        let s = temp_store();
+        let model_id = "73740b443bdc00afda5fa34eb9999d3fea77dcc3f6de238fab701394cdc96fb3";
+        // A sealed prompt naming two responders (keryx-node private.rs layout).
+        let mut envelope = vec![0x00, b'K', b'X', b'P', 0x01, 0x02];
+        envelope.extend_from_slice(&[0x5a; 32 + 12]); // ephemeral key rest + nonce
+        envelope.push(2);
+        for key in [0x44u8, 0x45] {
+            envelope.extend_from_slice(&[key; 32]);
+            envelope.extend_from_slice(&[0x7c; 48]);
+        }
+        envelope.extend_from_slice(&[0xee; 16 + 64]);
+        let txid = "c1".repeat(32);
+        let payload = ai_request_payload(model_id, &envelope);
+        s.apply(&[group("blk1", 100, vec![routed_request(&txid, &payload)])])
+            .unwrap();
+
+        // Both named responders answer; the first accepted is the feed's
+        // summary, the second must not overwrite it.
+        let sealed_a = [&[0x00, b'K', b'X', b'P', 0x01][..], &[0x9a; 12 + 40]].concat();
+        let sealed_b = [&[0x00, b'K', b'X', b'P', 0x01][..], &[0x9b; 12 + 40]].concat();
+        s.apply(&[group(
+            "blk2",
+            101,
+            vec![v2_response(&"d1".repeat(32), &txid, 0x44, Some(&sealed_a))],
+        )])
+        .unwrap();
+        s.apply(&[group(
+            "blk3",
+            102,
+            vec![
+                v2_response(&"d2".repeat(32), &txid, 0x45, Some(&sealed_b)),
+                // a responder that could not open the request says so in plaintext
+                v2_response(&"d3".repeat(32), &txid, 0x46, Some(b"could not open")),
+            ],
+        )])
+        .unwrap();
+
+        let feed = s.inference_feed(10, 0).unwrap();
+        let (req, resp) = &feed[0];
+        assert!(req.private);
+        assert_eq!(req.recipient_count, Some(2));
+        assert_eq!(req.prompt, "");
+        assert_eq!(req.request_hash, txid);
+        let resp = resp.as_ref().unwrap();
+        assert_eq!(resp.tx_id.as_deref(), Some("d1".repeat(32).as_str()));
+        assert_eq!(resp.result_block_hash, "blk2");
+        assert!(resp.inline_body);
+
+        let detail = s.inference_by_tx(&txid).unwrap().expect("by tx id");
+        let got: Vec<_> = detail
+            .responses
+            .iter()
+            .map(|(itx, r)| (itx.tx_id.clone(), r.private_body.clone().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("d1".repeat(32), sealed_a),
+                ("d2".repeat(32), sealed_b),
+                ("d3".repeat(32), b"could not open".to_vec()),
+            ]
+        );
+        assert!(s.inference_by_tx(&"ff".repeat(32)).unwrap().is_none());
+
+        // Expiry takes the request, its summary and its response list along.
+        s.expire_below(200).unwrap();
+        assert!(s.inference_feed(10, 0).unwrap().is_empty());
+        assert!(s.inference_by_tx(&txid).unwrap().is_none());
+        let read = s.db.begin_read().unwrap();
+        assert_eq!(read.open_table(AI_RESP).unwrap().len().unwrap(), 0);
+        assert_eq!(read.open_table(AI_RESP_LIST).unwrap().len().unwrap(), 0);
+        assert_eq!(read.open_table(AI_REQ_BY_HASH).unwrap().len().unwrap(), 0);
+    }
+
+    /// Byte-compatible with the `AiRequestRec` / `AiResponseRec` that shim
+    /// 0.3.0 wrote.
+    #[derive(Serialize)]
+    struct LegacyRequest<'a> {
+        tx_id: &'a str,
+        model_id: &'a str,
+        max_tokens: u32,
+        inference_reward: u64,
+        priority_fee: u64,
+        prompt: &'a str,
+        daa_score: u64,
+        block_hash: &'a str,
+        request_hash: &'a str,
+        miner_pubkey: Option<&'a str>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyResponse<'a> {
+        cid: &'a str,
+        result_block_hash: &'a str,
+        response_length: u32,
+        daa_score: u64,
+    }
+
+    #[test]
+    fn rows_from_shim_0_3_0_still_decode_and_join() {
+        let s = temp_store();
+        let txid = "e1".repeat(32);
+        let digest = "e2".repeat(32);
+        // A routed request indexed by 0.3.0 under its payload digest; its
+        // response was filed under the tx id the miner named.
+        let write = s.db.begin_write().unwrap();
+        {
+            let legacy = LegacyRequest {
+                tx_id: &txid,
+                model_id: "fa2f13be0850e26c5ce86c7ac79da85e300c1da8b3290f9a18d47105f1f2140a",
+                max_tokens: 64,
+                inference_reward: 1,
+                priority_fee: 2,
+                prompt: "old prompt",
+                daa_score: 100,
+                block_hash: "blkOld",
+                request_hash: &digest,
+                miner_pubkey: None,
+            };
+            write
+                .open_table(AI_REQ)
+                .unwrap()
+                .insert(0, enc(&legacy).as_slice())
+                .unwrap();
+            write
+                .open_table(AI_REQ_BY_HASH)
+                .unwrap()
+                .insert(digest.as_str(), 0)
+                .unwrap();
+            let legacy = LegacyResponse {
+                cid: "QmOld",
+                result_block_hash: "blkResp",
+                response_length: 9,
+                daa_score: 101,
+            };
+            write
+                .open_table(AI_RESP)
+                .unwrap()
+                .insert(txid.as_str(), enc(&legacy).as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+
+        let feed = s.inference_feed(10, 0).unwrap();
+        let (req, resp) = &feed[0];
+        assert_eq!(req.prompt, "old prompt");
+        assert!(!req.private);
+        assert_eq!(req.recipient_count, None);
+        let resp = resp.as_ref().expect("joined by tx id fallback");
+        assert_eq!(resp.cid, "QmOld");
+        assert_eq!(resp.tx_id, None);
+        assert!(!resp.inline_body);
+
+        // Expiry clears both keys of the legacy row.
+        s.expire_below(200).unwrap();
+        let read = s.db.begin_read().unwrap();
+        assert_eq!(read.open_table(AI_REQ).unwrap().len().unwrap(), 0);
+        assert_eq!(read.open_table(AI_REQ_BY_HASH).unwrap().len().unwrap(), 0);
+        assert_eq!(read.open_table(AI_RESP).unwrap().len().unwrap(), 0);
     }
 
     #[test]

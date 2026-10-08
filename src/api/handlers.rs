@@ -471,6 +471,42 @@ pub struct InferQuery {
     offset: Option<usize>,
 }
 
+/// One `/infer` row: a request joined with its first accepted response.
+fn infer_row(
+    req: &crate::indexer::store::AiRequestRec,
+    resp: Option<&crate::indexer::store::AiResponseRec>,
+) -> Value {
+    json!({
+        "tx_id": req.tx_id,
+        "model": model_name(&req.model_id),
+        // "" for a private request: the prompt is sealed to the tier's miners.
+        "prompt": req.prompt,
+        "private": req.private,
+        "recipient_count": req.recipient_count,
+        "max_tokens": req.max_tokens,
+        "inference_reward": req.inference_reward,
+        "priority_fee": req.priority_fee,
+        "daa_score": req.daa_score,
+        "block_hash": req.block_hash,
+        // The request's identity as its responses name it (the tx id from H8
+        // on) — also the request-side input of an H14 answer's decryption.
+        "request_hash": req.request_hash,
+        // first 16 hex of request_hash — what the wallet matches
+        // against a challenge's request_hash_hex[..16].
+        "payload_prefix": req.request_hash.chars().take(16).collect::<String>(),
+        "result": resp.map(|r| r.cid.clone()),
+        // off-chain; the wallet fetches it via GET /ipfs/{cid}.
+        "result_text": Value::Null,
+        "result_block_hash": resp.map(|r| r.result_block_hash.clone()),
+        "result_tx_id": resp.and_then(|r| r.tx_id.clone()),
+        "responder_pubkey": resp.and_then(|r| r.responder_pubkey.clone()),
+        // H14: the answer is inline in the response, sealed to the requester
+        // (read it via /infer/{tx_id}); `result` is then only its multihash,
+        // not an IPFS pin.
+        "result_inline": resp.is_some_and(|r| r.inline_body),
+    })
+}
+
 pub async fn infer(State(app): State<AppState>, Query(q): Query<InferQuery>) -> Json<Value> {
     let Some(store) = inference_store(&app) else {
         return Json(json!([]));
@@ -479,28 +515,54 @@ pub async fn infer(State(app): State<AppState>, Query(q): Query<InferQuery>) -> 
     let offset = q.offset.unwrap_or(0);
     let feed = store.inference_feed(limit, offset).unwrap_or_default();
     Json(Value::Array(
-        feed.into_iter()
-            .map(|(req, resp)| {
+        feed.iter()
+            .map(|(req, resp)| infer_row(req, resp.as_ref()))
+            .collect(),
+    ))
+}
+
+/// One request by tx id with every response to it, inline bodies included —
+/// how a requester fetches its sealed (H14) answer. A private request is
+/// answered by each responder it was sealed to, each under its own key, so
+/// any body that opens with the requester's root key will do; a body that is
+/// not an envelope (`body_sealed: false`) is the responder's plaintext note
+/// that it could not open the request.
+pub async fn infer_one(
+    State(app): State<AppState>,
+    Path(tx_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if !is_txid(&tx_id) {
+        return Err(ApiError::BadRequest(
+            "transaction id must be 64 hex chars".into(),
+        ));
+    }
+    let store = require_index(&app)?;
+    let Some(detail) = store.inference_by_tx(&tx_id)? else {
+        return Err(ApiError::NotFound(
+            "inference request not found within the indexer window".into(),
+        ));
+    };
+    let mut row = infer_row(&detail.request, detail.first_response.as_ref());
+    row["responses"] = Value::Array(
+        detail
+            .responses
+            .iter()
+            .map(|(itx, resp)| {
+                let body = resp.private_body.as_deref();
                 json!({
-                    "tx_id": req.tx_id,
-                    "model": model_name(&req.model_id),
-                    "prompt": req.prompt,
-                    "max_tokens": req.max_tokens,
-                    "inference_reward": req.inference_reward,
-                    "priority_fee": req.priority_fee,
-                    "daa_score": req.daa_score,
-                    "block_hash": req.block_hash,
-                    // first 16 hex of request_hash — what the wallet matches
-                    // against a challenge's request_hash_hex[..16].
-                    "payload_prefix": req.request_hash.chars().take(16).collect::<String>(),
-                    "result": resp.as_ref().map(|r| r.cid.clone()),
-                    // off-chain; the wallet fetches it via GET /ipfs/{cid}.
-                    "result_text": Value::Null,
-                    "result_block_hash": resp.as_ref().map(|r| r.result_block_hash.clone()),
+                    "tx_id": itx.tx_id,
+                    "block_hash": itx.accepting_block_hash,
+                    "daa_score": itx.accepting_daa,
+                    "cid": resp.cid,
+                    "response_length": resp.response_length,
+                    "responder_pubkey": resp.responder_pubkey,
+                    "body": body.map(crate::indexer::inference::to_hex),
+                    "body_sealed": body.is_some_and(crate::indexer::inference::is_private),
                 })
             })
             .collect(),
-    ))
+    );
+    Ok(Json(row))
 }
 
 #[derive(Deserialize)]

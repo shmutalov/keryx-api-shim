@@ -51,6 +51,7 @@ pub fn router(state: AppState) -> Router {
         // AI-inference oracle (phase 2c) — served from the indexer, else [].
         .route("/api/v1/capabilities", get(handlers::capabilities))
         .route("/api/v1/infer", get(handlers::infer))
+        .route("/api/v1/infer/{tx_id}", get(handlers::infer_one))
         .route("/api/v1/challenges", get(handlers::challenges))
         .route("/ipfs/{cid}", get(handlers::ipfs))
         .route("/health", get(handlers::health))

@@ -87,7 +87,8 @@ Implemented against the wallet's real client (`src/lib/api.js`) and protocol not
 | `POST /api/v1/broadcast` | `submitTransaction` | wallet wire JSON incl. string-encoded u64 `sequence`; `allowOrphan` always false |
 | `GET /api/v1/market` | proxied upstream or **404** | wallet catch-guards this and hides USD values |
 | `GET /api/v1/capabilities` | **indexer** or `[]` | models declared in coinbase `/ai:cap:` markers, with miner pubkeys/count/`last_seen_daa` |
-| `GET /api/v1/infer?limit&offset` | **indexer** or `[]` | AiRequest feed joined with responses; `payload_prefix`, `result` (IPFS CID), `result_text: null` (fetch via `/ipfs/{cid}`) |
+| `GET /api/v1/infer?limit&offset` | **indexer** or `[]` | AiRequest feed joined with its first response; `request_hash`, `payload_prefix`, `result` (IPFS CID), `result_text: null` (fetch via `/ipfs/{cid}`); `private`/`recipient_count`, `result_tx_id`/`responder_pubkey`/`result_inline` (H14) |
+| `GET /api/v1/infer/{tx_id}` | **indexer** or 404 | one request with every response to it (`responses[]` incl. the inline `body` hex) — how a requester reads its sealed H14 answer |
 | `GET /api/v1/challenges?limit` | **indexer** or `[]` | fraud challenges; `fraud_proven` always `false` (node removed on-chain slashing in v1.2.3) |
 | `GET /ipfs/{cid}` | proxied gateway or **404** | CIDv0 only, 1 MiB cap |
 | `GET /health` | `getServerInfo` | shim + node health; `indexer` section (state, checkpoint/window DAA, counts) when enabled |
@@ -129,9 +130,14 @@ Operational notes:
   markers. Inference result *text* is off-chain — only the IPFS CID is on-chain,
   fetched via `/ipfs/{cid}`. `fraud_proven` is always `false` (keryx-node
   removed on-chain slashing in v1.2.3).
-  Synced with keryx-node v1.6.1 (H13): since H8 (reward routing) a request's
+  Synced with keryx-node v1.6.4 (H14): since H8 (reward routing) a request's
   reward sits in the keyless `OP_RETURN "aivault"` output rather than a CSV
-  escrow naming a miner, so routed requests index with no target miner.
+  escrow naming a miner, so routed requests index with no target miner, and
+  responses reference the request by its **tx id**. Since H14 (private
+  inference) every prompt is sealed to the tier's miners (`prompt: ""`,
+  `private: true`) and each answer travels inline in its response, sealed to
+  the requester — `result` is then only the body's multihash, not an IPFS pin;
+  read the body from `/api/v1/infer/{tx_id}`. The shim never decrypts.
 
 ## Pointing the wallet extension at the shim
 
