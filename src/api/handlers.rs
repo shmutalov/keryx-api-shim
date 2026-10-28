@@ -472,8 +472,9 @@ pub struct InferQuery {
 }
 
 /// One `/infer` row: a request joined with its first accepted response. Field
-/// names follow keryx-labs.com's `/infer` (its H14 `sealed` /
-/// `sealed_recipients` are the node's "private" request and its recipients).
+/// names follow keryx-labs.com's `/infer`. Like its feed, this one lists only
+/// public requests (the store skips sealed ones), so `sealed` is always false
+/// and `sealed_recipients` null here; both are kept for the same shape.
 fn infer_row(
     req: &crate::indexer::store::AiRequestRec,
     resp: Option<&crate::indexer::store::AiResponseRec>,
@@ -481,7 +482,6 @@ fn infer_row(
     json!({
         "tx_id": req.tx_id,
         "model": model_name(&req.model_id),
-        // "" for a sealed request: the prompt is readable by the tier's miners only.
         "prompt": req.prompt,
         "sealed": req.private,
         "sealed_recipients": req.recipient_count,
@@ -503,9 +503,9 @@ fn infer_row(
         "request_hash": req.request_hash,
         "result_tx_id": resp.and_then(|r| r.tx_id.clone()),
         "responder_pubkey": resp.and_then(|r| r.responder_pubkey.clone()),
-        // H14: the answer is inline in the response, sealed to the requester
-        // (read it via /inference/{tx_id}); `result` is then only its
-        // multihash, not an IPFS pin.
+        // The answer is inline in the response (H14) rather than on IPFS.
+        // Only sealed requests are answered inline and the feed omits them,
+        // so this is false in practice; /inference/{tx_id} carries the bodies.
         "result_inline": resp.is_some_and(|r| r.inline_body),
     })
 }
@@ -557,6 +557,7 @@ pub async fn inference(
             Some(json!({
                 "responder_pubkey": resp.responder_pubkey,
                 "body": crate::indexer::inference::to_hex(body),
+                "response_length": resp.response_length,
                 "tx_id": itx.tx_id,
                 "block_hash": itx.accepting_block_hash,
                 "daa_score": itx.accepting_daa,

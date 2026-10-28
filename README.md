@@ -87,8 +87,8 @@ Implemented against the wallet's real client (`src/lib/api.js`) and protocol not
 | `POST /api/v1/broadcast` | `submitTransaction` | wallet wire JSON incl. string-encoded u64 `sequence`; `allowOrphan` always false |
 | `GET /api/v1/market` | proxied upstream or **404** | wallet catch-guards this and hides USD values |
 | `GET /api/v1/capabilities` | **indexer** or `[]` | models declared in coinbase `/ai:cap:` markers, with miner pubkeys/count/`last_seen_daa` |
-| `GET /api/v1/infer?limit&offset` | **indexer** or `[]` | AiRequest feed joined with its first response, in keryx-labs.com's fields: `payload_prefix`, `result` (IPFS CID), `result_text: null` (fetch via `/ipfs/{cid}`), `result_daa_score`, H14 `sealed`/`sealed_recipients`; shim extras `request_hash`, `result_tx_id`, `responder_pubkey`, `result_inline` |
-| `GET /api/v1/inference/{tx_id}` | **indexer** or 404 | one request, keryx-labs.com shape: `status`, `sealed`, `sealed_recipients`, `sealed_responses[]` (`responder_pubkey` + inline `body` hex, oldest first), `result_cid`/`result_block_hash`/`result_daa_score` — how a requester reads its sealed H14 answer |
+| `GET /api/v1/infer?limit&offset` | **indexer** or `[]` | public (unsealed) AiRequests joined with their first response, in keryx-labs.com's fields — like its feed, sealed H14 requests are left out (read them via `/inference/{tx_id}`): `payload_prefix`, `result` (IPFS CID), `result_text: null` (fetch via `/ipfs/{cid}`), `result_daa_score`, H14 `sealed`/`sealed_recipients`; shim extras `request_hash`, `result_tx_id`, `responder_pubkey`, `result_inline` |
+| `GET /api/v1/inference/{tx_id}` | **indexer** or 404 | one request, keryx-labs.com shape: `status`, `sealed`, `sealed_recipients`, `sealed_responses[]` (`responder_pubkey`, inline `body` hex and `response_length`, oldest first), `result_cid`/`result_block_hash`/`result_daa_score` — how a requester reads its sealed H14 answer |
 | `GET /api/v1/ai/providers` | `getServiceProviders` ×2 (keryxd ≥ 1.6.4) | `{virtual_daa_score, window_daa: 18000, cohort[], window[]}`, each `{tier, model, model_id, identity, escrow_pubkey}` — the miners an H14 request is sealed to; cached 3 s; **503** on an older node (never sent: it would drop the gRPC stream) |
 | `GET /api/v1/challenges?limit` | **indexer** or `[]` | fraud challenges; `fraud_proven` always `false` (node removed on-chain slashing in v1.2.3) |
 | `GET /ipfs/{cid}` | proxied gateway or **404** | CIDv0 only, 1 MiB cap |
@@ -131,15 +131,20 @@ Operational notes:
   markers. Inference result *text* is off-chain — only the IPFS CID is on-chain,
   fetched via `/ipfs/{cid}`. `fraud_proven` is always `false` (keryx-node
   removed on-chain slashing in v1.2.3).
-  Synced with keryx-node v1.6.4 (H14): since H8 (reward routing) a request's
+  Synced with keryx-node v1.6.6 (H15): since H8 (reward routing) a request's
   reward sits in the keyless `OP_RETURN "aivault"` output rather than a CSV
   escrow naming a miner, so routed requests index with no target miner, and
   responses reference the request by its **tx id**. Since H14 (private
-  inference) every prompt is sealed to the tier's miners (`prompt: ""`,
-  `sealed: true`) and each answer travels inline in its response, sealed to
-  the requester — `result` is then only the body's multihash, not an IPFS pin;
-  read the bodies from `/api/v1/inference/{tx_id}`, and get the miners to seal
-  to from `/api/v1/ai/providers`. The shim never encrypts or decrypts.
+  inference) every prompt is sealed to the tier's miners (such requests are
+  left out of `/infer`, as on keryx-labs.com) and each answer travels inline
+  in its response, sealed to the requester — its CID field is only the body's
+  multihash, not an IPFS pin; read the bodies from
+  `/api/v1/inference/{tx_id}`, and get the miners to seal to from
+  `/api/v1/ai/providers`. The shim never encrypts or decrypts. Since
+  H15 (verifiable inference) each sealed body is followed by a trace
+  commitment and the responder later sends opening transactions (subnetwork
+  06) for the node's audit; the shim reads past the commitment and stores
+  openings as plain transactions, without interpreting them.
 
 ## Pointing the wallet extension at the shim
 

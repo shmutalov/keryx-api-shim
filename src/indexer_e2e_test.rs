@@ -76,7 +76,8 @@ fn sealed_request() -> proto::RpcTransaction {
     }
 }
 
-/// A V2 AiResponse naming REQ_TX, optionally carrying an inline body.
+/// A V2 AiResponse naming REQ_TX, optionally carrying an inline body — in the
+/// H15 form, followed by a trace commitment with its tokens root.
 fn response(id: &str, responder: &str, body: Option<&[u8]>) -> proto::RpcTransaction {
     use crate::indexer::inference::{from_hex, to_hex};
     let mut p = from_hex(REQ_TX).unwrap();
@@ -90,6 +91,10 @@ fn response(id: &str, responder: &str, body: Option<&[u8]>) -> proto::RpcTransac
         p.push(0x80);
         p.extend_from_slice(&(body.len() as u32).to_le_bytes());
         p.extend_from_slice(body);
+        // [0x81][73 LE][trace_root 32][n_prompt 4][n_pos 4][stage 1][tokens_root 32]
+        p.push(0x81);
+        p.extend_from_slice(&73u32.to_le_bytes());
+        p.extend_from_slice(&[0x5a; 73]);
     }
     proto::RpcTransaction {
         payload: to_hex(&p),
@@ -490,7 +495,8 @@ async fn indexer_pipeline_end_to_end() {
 
     // --- H14 inference, in keryx-labs.com's field names ---
 
-    // GET /api/v1/infer — the sealed request, joined to its first response.
+    // GET /api/v1/infer — like keryx-labs.com's feed, it leaves sealed
+    // requests out; the only request here is sealed.
     let feed: serde_json::Value = http
         .get(format!("{base}/api/v1/infer?limit=10"))
         .send()
@@ -499,18 +505,7 @@ async fn indexer_pipeline_end_to_end() {
         .json()
         .await
         .unwrap();
-    let row = &feed[0];
-    assert_eq!(row["tx_id"], REQ_TX);
-    assert_eq!(row["model"], "qwen3.8-27b");
-    assert_eq!(row["prompt"], "");
-    assert_eq!(row["sealed"], true);
-    assert_eq!(row["sealed_recipients"], 2);
-    assert_eq!(row["payload_prefix"], &REQ_TX[..16]);
-    assert_eq!(row["result_block_hash"], BLOCK_D);
-    assert_eq!(row["result_daa_score"], 103);
-    assert_eq!(row["result_tx_id"], RESP_SEALED);
-    assert_eq!(row["responder_pubkey"], RESPONDER_A);
-    assert_eq!(row["result_inline"], true);
+    assert_eq!(feed, serde_json::json!([]));
 
     // GET /api/v1/inference/{tx_id} — only inline bodies are sealed responses.
     let inference: serde_json::Value = http
@@ -522,6 +517,9 @@ async fn indexer_pipeline_end_to_end() {
         .await
         .unwrap();
     assert_eq!(inference["tx_id"], REQ_TX);
+    assert_eq!(inference["model"], "qwen3.8-27b");
+    assert_eq!(inference["prompt"], "");
+    assert_eq!(inference["result_block_hash"], BLOCK_D);
     assert_eq!(inference["status"], "completed");
     assert_eq!(inference["sealed"], true);
     assert_eq!(inference["sealed_recipients"], 2);
@@ -531,6 +529,7 @@ async fn indexer_pipeline_end_to_end() {
         serde_json::json!([{
             "responder_pubkey": RESPONDER_A,
             "body": crate::indexer::inference::to_hex(SEALED_BODY),
+            "response_length": 64,
             "tx_id": RESP_SEALED,
             "block_hash": BLOCK_D,
             "daa_score": 103,

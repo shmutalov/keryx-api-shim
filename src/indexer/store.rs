@@ -1018,8 +1018,8 @@ impl Store {
 
     // --- AI inference reads (phase 2c) ---
 
-    /// Newest-first inference requests, each joined with its response (if the
-    /// miner has published one yet).
+    /// Newest-first public (unsealed) inference requests, each joined with its
+    /// first response (if a miner has published one yet).
     pub fn inference_feed(
         &self,
         limit: usize,
@@ -1031,15 +1031,21 @@ impl Store {
         let mut out = Vec::new();
         let mut skipped = 0usize;
         for item in req_t.iter()?.rev() {
+            if out.len() >= limit {
+                break;
+            }
             let (_k, v) = item?;
+            let req = dec_request(v.value())?;
+            // Sealed (H14) requests are left out, as keryx-labs.com's feed
+            // does: their prompt is unreadable here, and the requester reads
+            // its answer via `inference_by_tx`. Paging counts public rows only.
+            if req.private {
+                continue;
+            }
             if skipped < offset {
                 skipped += 1;
                 continue;
             }
-            if out.len() >= limit {
-                break;
-            }
-            let req = dec_request(v.value())?;
             let resp = first_response(&resp_t, &req)?;
             out.push((req, resp));
         }
@@ -1775,18 +1781,19 @@ mod tests {
         )])
         .unwrap();
 
-        let feed = s.inference_feed(10, 0).unwrap();
-        let (req, resp) = &feed[0];
+        // The feed leaves sealed requests out; the request is read by tx id.
+        assert!(s.inference_feed(10, 0).unwrap().is_empty());
+        let detail = s.inference_by_tx(&txid).unwrap().expect("by tx id");
+        let req = &detail.request;
         assert!(req.private);
         assert_eq!(req.recipient_count, Some(2));
         assert_eq!(req.prompt, "");
         assert_eq!(req.request_hash, txid);
-        let resp = resp.as_ref().unwrap();
+        let resp = detail.first_response.as_ref().unwrap();
         assert_eq!(resp.tx_id.as_deref(), Some("d1".repeat(32).as_str()));
         assert_eq!(resp.result_block_hash, "blk2");
         assert!(resp.inline_body);
 
-        let detail = s.inference_by_tx(&txid).unwrap().expect("by tx id");
         let got: Vec<_> = detail
             .responses
             .iter()
@@ -1801,6 +1808,41 @@ mod tests {
             ]
         );
         assert!(s.inference_by_tx(&"ff".repeat(32)).unwrap().is_none());
+
+        // Public requests around a second sealed one: the feed lists them
+        // newest first, and neither the limit nor the offset counts a sealed
+        // row.
+        let request =
+            |tx: &str, prompt: &[u8]| routed_request(tx, &ai_request_payload(model_id, prompt));
+        s.apply(&[group(
+            "blk4",
+            103,
+            vec![request(&"b4".repeat(32), b"older")],
+        )])
+        .unwrap();
+        s.apply(&[group(
+            "blk5",
+            104,
+            vec![request(&"c2".repeat(32), &envelope)],
+        )])
+        .unwrap();
+        s.apply(&[group(
+            "blk6",
+            105,
+            vec![request(&"b6".repeat(32), b"newer")],
+        )])
+        .unwrap();
+        let prompts = |limit, offset| -> Vec<String> {
+            s.inference_feed(limit, offset)
+                .unwrap()
+                .into_iter()
+                .map(|(r, _)| r.prompt)
+                .collect()
+        };
+        assert_eq!(prompts(10, 0), ["newer", "older"]);
+        assert_eq!(prompts(2, 0), ["newer", "older"]);
+        assert_eq!(prompts(1, 1), ["older"]);
+        assert!(prompts(1, 2).is_empty());
 
         // Expiry takes the request, its summary and its response list along.
         s.expire_below(200).unwrap();

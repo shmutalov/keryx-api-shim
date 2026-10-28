@@ -44,8 +44,16 @@ const PRIVATE_TAG_LEN: usize = 16;
 /// AiResponse extension kind carrying the inline (sealed) answer:
 /// `[0x80] [len: 4 LE] [body: len]` after the 174-byte V2 head.
 const RESPONSE_EXT_PRIVATE_BODY: u8 = 0x80;
+/// H15 extension kind after the body: the inference trace commitment
+/// `[trace_root: 32] [n_prompt: 4] [n_pos: 4] [stage: 1]`, optionally followed
+/// by `[tokens_root: 32]` (keryx-node `TraceCommitment`).
+const RESPONSE_EXT_TRACE: u8 = 0x81;
+const RESPONSE_TRACE_LEN: usize = 32 + 4 + 4 + 1;
+const RESPONSE_TRACE_TOKENS_LEN: usize = RESPONSE_TRACE_LEN + 32;
 const RESPONSE_EXT_HEADER_LEN: usize = 1 + 4;
-const MAX_RESPONSE_PRIVATE_BODY_LEN: usize = 32 * 1024;
+/// 32 KiB until the node's `trace_chain_activation` (H15), 48 KiB after; the
+/// node enforces the era, the shim accepts either.
+const MAX_RESPONSE_PRIVATE_BODY_LEN: usize = 48 * 1024;
 
 /// Whether a prompt (or an inline answer body) is a private-inference envelope —
 /// the node's `PrivateRequestEnvelope::is_private`, the check its miners use.
@@ -74,7 +82,9 @@ pub fn private_recipient_count(prompt: &[u8]) -> Option<u32> {
         return None;
     }
     let keys = prompt[PRIVATE_REQUEST_HEADER_LEN..entries_end]
-        .chunks_exact(PRIVATE_RECIPIENT_ENTRY_LEN)
+        .as_chunks::<PRIVATE_RECIPIENT_ENTRY_LEN>()
+        .0
+        .iter()
         .map(|entry| &entry[..32]);
     let ascending = keys.clone().zip(keys.skip(1)).all(|(a, b)| a < b);
     ascending.then_some(n as u32)
@@ -271,11 +281,12 @@ pub struct AiResponse {
 
 pub fn decode_response(payload: &[u8]) -> Option<AiResponse> {
     // V2 responses (H6) append [escrow_pubkey: 32][schnorr_sig: 64] after the
-    // 78 v1 bytes; from H14 a V2 head may be followed by one extension
-    // [0x80][len: 4 LE][body] carrying the answer inline. The v1 fields sit at
-    // the same offsets in every era, so `>=` decodes them all; an extension
-    // that does not account for every trailing byte is ignored rather than
-    // failing the whole response (the node has already judged validity).
+    // 78 v1 bytes; from H14 a V2 head may be followed by the extension
+    // [0x80][len: 4 LE][body] carrying the answer inline, and from H15 the body
+    // by [0x81][len: 4 LE][trace commitment]. The v1 fields sit at the same
+    // offsets in every era, so `>=` decodes them all; extensions that do not
+    // account for every trailing byte yield no body rather than failing the
+    // whole response (the node has already judged validity).
     if payload.len() < RESPONSE_LEN {
         return None;
     }
@@ -285,8 +296,11 @@ pub fn decode_response(payload: &[u8]) -> Option<AiResponse> {
         .filter(|ext| ext.len() > RESPONSE_EXT_HEADER_LEN && ext[0] == RESPONSE_EXT_PRIVATE_BODY)
         .and_then(|ext| {
             let len = u32::from_le_bytes(ext[1..5].try_into().unwrap()) as usize;
-            let body = &ext[RESPONSE_EXT_HEADER_LEN..];
-            (len == body.len() && len <= MAX_RESPONSE_PRIVATE_BODY_LEN).then(|| body.to_vec())
+            let body =
+                ext.get(RESPONSE_EXT_HEADER_LEN..RESPONSE_EXT_HEADER_LEN.checked_add(len)?)?;
+            let rest = &ext[RESPONSE_EXT_HEADER_LEN + len..];
+            (len <= MAX_RESPONSE_PRIVATE_BODY_LEN && (rest.is_empty() || is_trace_extension(rest)))
+                .then(|| body.to_vec())
         });
     // bytes [40..74] are the raw multihash (0x12 0x20 || 32-byte sha2-256);
     // base58btc of that is the CIDv0.
@@ -299,6 +313,16 @@ pub fn decode_response(payload: &[u8]) -> Option<AiResponse> {
         responder_pubkey,
         private_body,
     })
+}
+
+/// Whether `ext` is exactly one H15 trace-commitment extension. The commitment
+/// itself (consumed by the node's audit) is not surfaced.
+fn is_trace_extension(ext: &[u8]) -> bool {
+    let n = ext.len().saturating_sub(RESPONSE_EXT_HEADER_LEN);
+    ext.len() > RESPONSE_EXT_HEADER_LEN
+        && ext[0] == RESPONSE_EXT_TRACE
+        && u32::from_le_bytes(ext[1..5].try_into().unwrap()) as usize == n
+        && (n == RESPONSE_TRACE_LEN || n == RESPONSE_TRACE_TOKENS_LEN)
 }
 
 // --- AiChallenge (05) ---------------------------------------------------------
@@ -558,7 +582,7 @@ mod tests {
         assert_eq!(
             AiResponse {
                 private_body: None,
-                ..r3
+                ..r3.clone()
             },
             r2
         );
@@ -571,6 +595,55 @@ mod tests {
         let mut kind = v3.clone();
         kind[RESPONSE_V2_LEN] = 0x01; // pipeline-link count range, not a body
         assert_eq!(decode_response(&kind).unwrap().private_body, None);
+
+        // H15: the body is followed by [0x81][len LE][trace commitment], with
+        // or without the 32-byte tokens root; the body still decodes.
+        for trace_len in [RESPONSE_TRACE_LEN, RESPONSE_TRACE_TOKENS_LEN] {
+            let mut v4 = v3.clone();
+            v4.push(RESPONSE_EXT_TRACE);
+            v4.extend_from_slice(&le_u32(trace_len as u32));
+            v4.extend(std::iter::repeat_n(0x5a, trace_len));
+            let r4 = decode_response(&v4).unwrap();
+            assert_eq!(r4, r3, "trace of {trace_len} bytes");
+
+            // A malformed trailer is not a trace: wrong kind, a length that
+            // disagrees with the bytes, a truncated or an overlong trailer.
+            let at = v3.len();
+            let mut bad_kind = v4.clone();
+            bad_kind[at] = 0x82;
+            let mut bad_len = v4.clone();
+            bad_len[at + 1..at + 5].copy_from_slice(&le_u32(trace_len as u32 - 1));
+            let mut truncated = v4.clone();
+            truncated.pop();
+            let mut longer = v4.clone();
+            longer.push(0);
+            for bad in [bad_kind, bad_len, truncated, longer] {
+                assert_eq!(decode_response(&bad).unwrap().private_body, None);
+            }
+        }
+        // Neither trace length is a valid commitment size on its own.
+        let mut stray = v3.clone();
+        stray.push(RESPONSE_EXT_TRACE);
+        stray.extend_from_slice(&le_u32(40));
+        stray.extend(std::iter::repeat_n(0, 40));
+        assert_eq!(decode_response(&stray).unwrap().private_body, None);
+
+        // H15 raises the inline body cap from 32 KiB to 48 KiB.
+        let big = |len: usize| {
+            let mut p = v2.clone();
+            p.push(RESPONSE_EXT_PRIVATE_BODY);
+            p.extend_from_slice(&le_u32(len as u32));
+            p.extend(std::iter::repeat_n(1, len));
+            p
+        };
+        assert!(decode_response(&big(48 * 1024))
+            .unwrap()
+            .private_body
+            .is_some());
+        assert_eq!(
+            decode_response(&big(48 * 1024 + 1)).unwrap().private_body,
+            None
+        );
     }
 
     #[test]

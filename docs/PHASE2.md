@@ -305,7 +305,10 @@ On-chain mechanics (from keryx-node `inference/src/ai_payload.rs`):
     plaintext requests are invalid, and the payload cap rises to 64 KiB. The
     shim never renders the ciphertext: `prompt: ""`, `sealed: true`,
     `sealed_recipients` from the envelope layout (keryx-labs.com's names for
-    the node's "private" request and its recipients).
+    the node's "private" request and its recipients). Like keryx-labs.com's
+    feed, `/infer` leaves sealed requests out (decided 2026-10-28); the store
+    skips them before applying `limit`/`offset`, and `/inference/{tx_id}`
+    still serves them.
   - Each named responder must answer (silent ones are struck), each sealing
     the answer under its own key and carrying it **inline**: a V2 head +
     `[0x80][len: 4 LE][body ≤ 32 KiB]`. The CID field is then just the body's
@@ -339,10 +342,41 @@ On-chain mechanics (from keryx-node `inference/src/ai_payload.rs`):
     their legacy layout (`dec_compat`), so an upgrade keeps the window. Rows
     indexed by 0.3.0 are not addressable by tx id (it keyed requests by
     digest only); they age out with the window.
+- **H15 verifiable inference** (keryx-node v1.6.5/v1.6.6, one gate for every
+  rule: mainnet DAA 140 115 000, testnet 3 500, never on simnet/devnet;
+  `verifiable-inference/`, `consensus/src/processes/verifiable_inference.rs`):
+  - A sealed answer body is followed by a second extension,
+    `[0x81][len: 4 LE][trace_root: 32][n_prompt: 4][n_pos: 4][stage: 1]`
+    plus an optional `[tokens_root: 32]` (len 41 or 73), covered by the
+    responder signature. One horizon after the gate a body without it is
+    invalid. The body cap rises from 32 KiB to 48 KiB. `decode_response`
+    accepts a body followed by nothing or by exactly one well-formed trace
+    extension; the commitment itself is not surfaced. Without this, H15
+    responses decoded with no body and `/inference/{tx_id}` returned no
+    `sealed_responses`. `/inference/{tx_id}` re-decodes stored payloads on
+    every read, so responses indexed before the fix display once it is
+    deployed; only the feed's stored `result_inline` flag would stay false.
+  - Every traced response is audited: its responder sends **opening**
+    transactions (new subnetwork `06`, zero inputs/outputs, payload
+    `[version: 1][response_txid: 32] … [escrow_pubkey: 32][signature: 64]`,
+    up to 112 KiB), chained layer to layer, plus attention/recurrent/residual
+    pieces. The shim stores them as plain transactions (served by
+    `/transactions/{id}`) and does not interpret them; audit verdicts live in
+    the node's service ledger, not in transaction data. The new
+    `getAwaitedOpenings` RPC (miner-facing) is vendored but not proxied.
+  - The reward is drawn among the miners credited on a request, untraced
+    answers are not credited, and PoM v5, deadlines, context floors and the
+    holder-reward table are node-only. Request identity (tx id), the request
+    envelope layout and the tier lineup (`POM_TIERS_H14`) are unchanged.
+    Key schedule 2 (`private.rs`) changes how clients derive keys, not the
+    envelope bytes; the shim never handles keys.
+  - Vendored protos refreshed to v1.6.6 (`RpcBlockHeader.taskRoot`,
+    `getAwaitedOpenings`). `/inference/{tx_id}` `sealed_responses[]` gained
+    `response_length`, which keryx-labs.com now emits.
 
 Endpoints served from the indexer (else `[]`): `/capabilities`, `/infer`
-(joined feed, `payload_prefix`, `result` CID, `result_text: null`, H14
-fields), `/challenges`; `/inference/{tx_id}` (else 404). `/ai/providers` is
+(joined feed of public requests, `payload_prefix`, `result` CID,
+`result_text: null`), `/challenges`; `/inference/{tx_id}` (else 404). `/ai/providers` is
 served live from the node. Inference rows respect the retention window.
 Verified: store unit tests drive real AiRequest/Response/Challenge/coinbase
 payloads through `apply()` and assert all reads + expiry, incl. routed (tx-id)
