@@ -373,6 +373,19 @@ On-chain mechanics (from keryx-node `inference/src/ai_payload.rs`):
   - Vendored protos refreshed to v1.6.6 (`RpcBlockHeader.taskRoot`,
     `getAwaitedOpenings`). `/inference/{tx_id}` `sealed_responses[]` gained
     `response_length`, which keryx-labs.com now emits.
+- **H16 service rules** (keryx-node v1.6.7, mainnet DAA 147 000 000, testnet
+  180 000, never on simnet/devnet): node-only. A uniform strike ladder (one
+  strike per request, at most one per hour per miner), suspensions judged at
+  the selected parent, untraced answers on audited tiers no longer serve their
+  request, a new audit pushes back the open audits of the same escrow key, and
+  a smaller PoM v5 context pad. No payload layout, request identity, subnetwork
+  or tier change. The feed's first response may be an untraced one the ledger
+  does not credit; the shim reports what was accepted on chain, not who was
+  credited. Vendored protos refreshed to v1.6.7: `getAwaitedOpenings` gained
+  `escrowPubkey`/`requestHashes` and returns `awaitedRequests`,
+  `requestsChecked` and `closedRequests` (miner-facing, not proxied). From H16
+  a node rejects peers older than 1.6.7, so the keryxd behind the shim must be
+  1.6.7 or newer to stay in sync.
 
 Endpoints served from the indexer (else `[]`): `/capabilities`, `/infer`
 (joined feed of public requests, `payload_prefix`, `result` CID,
